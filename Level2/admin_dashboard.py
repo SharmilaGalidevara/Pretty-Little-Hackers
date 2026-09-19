@@ -15,7 +15,7 @@ DASH = """
 *{box-sizing:border-box}body{margin:0;background:#07111f;color:#e5e7eb;font-family:'Segoe UI',Arial}
 header{height:64px;padding:0 20px;background:#0e1a2c;border-bottom:1px solid #26364e;display:flex;align-items:center;justify-content:space-between}
 .brand{font-size:21px;font-weight:900;color:#67e8f9}.mini{font-size:10px;color:#94a3b8}a{color:#67e8f9;text-decoration:none}
-.page{max-width:1500px;margin:auto;padding:14px}.kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin-bottom:10px}
+.page{max-width:1500px;margin:auto;padding:14px}.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:9px;margin-bottom:10px}
 .card,.kpi{background:#101b2d;border:1px solid #26364e;border-radius:13px;padding:12px}.kpi .v{font-size:24px;font-weight:900}.kpi .k{font-size:10px;color:#94a3b8;text-transform:uppercase}
 .good{color:#86efac}.cyan{color:#67e8f9}.warn{color:#fbbf24}.bad{color:#f87171}
 .grid{display:grid;grid-template-columns:1.35fr .65fr;gap:10px}.two{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
@@ -41,6 +41,8 @@ button,input{padding:6px 8px;border-radius:7px}button{border:0;background:#0284c
 <div class="kpi"><div class="v {{'good' if delta is not none and delta>=0 else 'bad'}}">{{delta_text}}</div><div class="k">Today vs Yesterday</div></div>
 <div class="kpi"><div class="v">{{today.paid_cars}}</div><div class="k">Paid Cars Today</div></div>
 <div class="kpi"><div class="v warn">{{'%.2f'|format(today.avg_ticket)}}</div><div class="k">Average / Paid Car</div></div>
+<div class="kpi"><div class="v bad">{{'%.2f'|format(maintenance.today_cost)}}</div><div class="k">Confirmed Maintenance Cost Today</div></div>
+<div class="kpi"><div class="v good">{{'%.2f'|format(maintenance.revenue_after_maintenance)}}</div><div class="k">Revenue After Maintenance Cost</div></div>
 </div>
 
 <div class="grid">
@@ -100,6 +102,32 @@ button,input{padding:6px 8px;border-radius:7px}button{border:0;background:#0284c
 
 <div class="two">
 <div class="card">
+<h2>Maintenance Economics — Actual Simulator Repair Costs</h2>
+<table>
+<tr><th>Repair Type</th><th>Completed Jobs</th><th>Actual Cost</th><th>Average Cost</th></tr>
+<tr><td>Preventive</td><td>{{maintenance.preventive_jobs}}</td><td>{{'%.2f'|format(maintenance.preventive_cost)}}</td><td>{{maintenance.preventive_avg}}</td></tr>
+<tr><td>Corrective</td><td>{{maintenance.corrective_jobs}}</td><td>{{'%.2f'|format(maintenance.corrective_cost)}}</td><td>{{maintenance.corrective_avg}}</td></tr>
+</table>
+<div class="mini" style="margin-top:8px">Costs are populated only from the simulator's component_fixed RepairCost webhook. No savings estimate is fabricated.</div>
+</div>
+<div class="card">
+<h2>Recent Maintenance Jobs</h2>
+<table><tr><th>Completed</th><th>Component</th><th>Type</th><th>Duration</th><th>Actual Cost</th></tr>
+{% for m in maintenance.recent %}
+<tr>
+<td>{{m.completed_simulator_time or '-'}}</td>
+<td><b>{{m.component}}</b><div class="mini">{{m.kind}}</div></td>
+<td>{{m.repair_type or '-'}}</td>
+<td>{{m.duration}}</td>
+<td>{{('%.2f'|format(m.repair_cost)) if m.repair_cost is not none else 'Pending'}}</td>
+</tr>
+{% else %}<tr><td colspan="5">No repair jobs recorded yet.</td></tr>{% endfor %}
+</table>
+</div>
+</div>
+
+<div class="two">
+<div class="card">
 <h2>Recent Accepted Payments</h2>
 <table><tr><th>Simulator Time</th><th>Plate</th><th>Parking</th><th>Charging</th><th>Total Paid</th></tr>
 {% for p in payments %}
@@ -143,6 +171,9 @@ REPORT = """
 <div class="c"><div class="v">{{summary.co_incidents}}</div><div class="mini">CO incidents</div></div>
 <div class="c"><div class="v">{{summary.broken}}</div><div class="mini">Broken events</div></div>
 <div class="c"><div class="v">{{summary.repairs}}</div><div class="mini">Maintenance actions</div></div>
+<div class="c"><div class="v">{{'%.2f'|format(summary.maintenance_cost)}}</div><div class="mini">Confirmed maintenance cost</div></div>
+<div class="c"><div class="v">{{summary.preventive_repairs}}</div><div class="mini">Preventive repairs</div></div>
+<div class="c"><div class="v">{{summary.corrective_repairs}}</div><div class="mini">Corrective repairs</div></div>
 <div class="c"><div class="v">{{summary.failed_logins}}</div><div class="mini">Failed logins (system time)</div></div>
 </div>
 <h2>Important Alerts</h2><table><tr><th>Simulator Time</th><th>Type</th><th>Target</th><th>Reason</th></tr>
@@ -160,6 +191,17 @@ AUDIT = """
 
 def db():
     c=sqlite3.connect(str(DB_PATH),timeout=10);c.row_factory=sqlite3.Row;return c
+
+def fmt_duration(seconds):
+    seconds = max(0, int(seconds or 0))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
 
 def current_sim_date(conn):
     row=conn.execute("SELECT value FROM system_state WHERE key='last_simulator_time'").fetchone()
@@ -217,16 +259,78 @@ def dashboard():
     overview={
         "alerts":count("SELECT COUNT(*) FROM alerts WHERE active=1 AND severity='CRITICAL'"),
         "broken":count("SELECT COUNT(*) FROM components WHERE broken=1"),
-        "maintenance_due":count("SELECT COUNT(*) FROM alerts WHERE active=1 AND alert_type='PREVENTIVE MAINTENANCE DUE'"),
+        "maintenance_due":count("SELECT COUNT(*) FROM components WHERE maintenance_required=1 AND broken=0"),
         "penalties":count("SELECT COUNT(*) FROM penalties WHERE substr(simulator_time,1,10)=?",(today_date,)),
         "failed_logins":count("SELECT COUNT(*) FROM login_attempts WHERE success=0 AND substr(attempted_at,1,10)=?",(datetime.now().strftime("%Y-%m-%d"),)),
         "events":count("SELECT COUNT(*) FROM events WHERE signature_status='verified' AND substr(server_time,1,10)=?",(today_date,))
     }
+    # Maintenance costs are simulator-confirmed RepairCost values only.
+    maintenance_today_cost = 0.0
+    if today_date:
+        maintenance_today_cost = float(conn.execute(
+            """SELECT COALESCE(SUM(repair_cost),0)
+               FROM maintenance_actions
+               WHERE status='COMPLETED'
+                 AND repair_cost IS NOT NULL
+                 AND substr(completed_simulator_time,1,10)=?""",
+            (today_date,)
+        ).fetchone()[0] or 0)
+
+    def repair_stats(repair_type):
+        row = conn.execute(
+            """SELECT COUNT(*) jobs,COALESCE(SUM(repair_cost),0) cost
+               FROM maintenance_actions
+               WHERE status='COMPLETED'
+                 AND repair_type=?
+                 AND repair_cost IS NOT NULL""",
+            (repair_type,)
+        ).fetchone()
+        jobs = int(row["jobs"] or 0)
+        cost = float(row["cost"] or 0)
+        avg = cost / jobs if jobs else None
+        return jobs, cost, avg
+
+    p_jobs, p_cost, p_avg = repair_stats("PREVENTIVE")
+    c_jobs, c_cost, c_avg = repair_stats("CORRECTIVE")
+
+    recent_maintenance = [dict(r) for r in conn.execute(
+        """SELECT * FROM maintenance_actions
+           ORDER BY id DESC LIMIT 8"""
+    ).fetchall()]
+    for m in recent_maintenance:
+        m["duration"] = fmt_duration(m.get("repair_duration_seconds"))
+
+    maintenance = {
+        "today_cost": maintenance_today_cost,
+        "revenue_after_maintenance": today["revenue"] - maintenance_today_cost,
+        "preventive_jobs": p_jobs,
+        "preventive_cost": p_cost,
+        "preventive_avg": f"{p_avg:.2f}" if p_avg is not None else "No data yet",
+        "corrective_jobs": c_jobs,
+        "corrective_cost": c_cost,
+        "corrective_avg": f"{c_avg:.2f}" if c_avg is not None else "No data yet",
+        "recent": recent_maintenance,
+    }
+
     payments=[dict(r) for r in conn.execute("""SELECT plate,payment_time,parking_cost,charging_cost,actual_paid FROM cars
                                                WHERE payment_status='PAID' ORDER BY payment_time DESC LIMIT 10""").fetchall()]
     logins=[dict(r) for r in conn.execute("SELECT * FROM login_attempts ORDER BY id DESC LIMIT 3").fetchall()]
     conn.close()
-    return render_template_string(DASH,sim_time=sim_time,today=today,yesterday=yesterday,delta=delta,delta_text=delta_text,daily=daily,mix=mix,hourly=hourly,overview=overview,payments=payments,logins=logins)
+    return render_template_string(
+        DASH,
+        sim_time=sim_time,
+        today=today,
+        yesterday=yesterday,
+        delta=delta,
+        delta_text=delta_text,
+        daily=daily,
+        mix=mix,
+        hourly=hourly,
+        overview=overview,
+        maintenance=maintenance,
+        payments=payments,
+        logins=logins
+    )
 
 @admin_bp.route("/penalties")
 def penalties():
@@ -247,7 +351,22 @@ def daily_report():
         "penalties":count("SELECT COUNT(*) FROM penalties WHERE substr(simulator_time,1,10)=?",(date,)),
         "co_incidents":count("SELECT COUNT(*) FROM alerts WHERE alert_type='HIGH CO LEVEL' AND substr(simulator_time,1,10)=?",(date,)),
         "broken":count("SELECT COUNT(*) FROM audit_log WHERE action='COMPONENT_BROKEN' AND substr(simulator_time,1,10)=?",(date,)),
-        "repairs":count("SELECT COUNT(*) FROM maintenance_actions WHERE substr(simulator_time,1,10)=?",(date,)),
+        "repairs":count("SELECT COUNT(*) FROM maintenance_actions WHERE substr(COALESCE(completed_simulator_time,simulator_time),1,10)=?",(date,)),
+        "maintenance_cost":float(conn.execute(
+            """SELECT COALESCE(SUM(repair_cost),0) FROM maintenance_actions
+               WHERE status='COMPLETED' AND repair_cost IS NOT NULL
+                 AND substr(completed_simulator_time,1,10)=?""",(date,)
+        ).fetchone()[0] or 0),
+        "preventive_repairs":count(
+            """SELECT COUNT(*) FROM maintenance_actions
+               WHERE status='COMPLETED' AND repair_type='PREVENTIVE'
+                 AND substr(completed_simulator_time,1,10)=?""",(date,)
+        ),
+        "corrective_repairs":count(
+            """SELECT COUNT(*) FROM maintenance_actions
+               WHERE status='COMPLETED' AND repair_type='CORRECTIVE'
+                 AND substr(completed_simulator_time,1,10)=?""",(date,)
+        ),
         "failed_logins":count("SELECT COUNT(*) FROM login_attempts WHERE success=0 AND substr(attempted_at,1,10)=?",(date,))
     }
     alerts=[dict(r) for r in conn.execute("SELECT * FROM alerts WHERE substr(simulator_time,1,10)=? ORDER BY id DESC LIMIT 100",(date,)).fetchall()]
