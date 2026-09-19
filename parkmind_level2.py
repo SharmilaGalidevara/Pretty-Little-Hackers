@@ -79,6 +79,7 @@ STUCK_STATE_TIMEOUT_SEC = 60      # watchdog retries ops stuck > 60s
 ANOMALY_PARKING_MULTIPLIER = 10   # 10x planned duration = anomaly
 HEALTH_SCORE_THRESHOLD_USES = 50  # rough estimate for component "wear"
 PAYMENT_TIMEOUT_SEC = 20            # unresolved exit payment -> alert
+EXIT_PAYMENT_RETRY_SEC = 2.0        # minimal retry delay for failed/pending payments
 EXIT_HOLD_RECOVERY_SEC = 180        # try to clear exit lane after prolonged unresolved payment
 EXIT_STUCK_ALERT_SEC = 15           # create/update CRITICAL alert after 15s at EXIT without departure
 ENTRY_GATE_IDLE_CLOSE_SEC = 1.0     # keep entry gate open briefly for back-to-back arrivals
@@ -111,8 +112,6 @@ lights = {}            # name -> dict (future-ready)
 
 reserved_spots = {}    # spot_name -> {"plate", "reserved_at"}
 entry_queue = []
-exit_queue  = []          # paid cars waiting for final gate release
-to_exit_queue = []        # parked cars waiting for the single exit approach
 
 # IMPORTANT PIPELINE MODEL:
 # entry_active = ONLY the vehicle currently crossing the entry gate.
@@ -121,7 +120,7 @@ entry_active = None
 in_transit = {}           # plate -> {"spot", "sent_at", "route_retries"}
 
 exit_active  = None
-exit_lane_plate = None    # only one car may approach/occupy EXIT at a time
+physical_exit_queue = []  # cars physically waiting in the exit lane queue
 
 state_lock = threading.RLock()
 
@@ -466,7 +465,7 @@ def infer_plate_for_alert(data=None, reason="", event_time=None):
     # 3) Current live controller state is strong evidence for entry/exit penalties.
     with state_lock:
         current_exit = exit_active.get("plate") if exit_active else None
-        current_exit_lane = exit_lane_plate
+        current_exit_lane = physical_exit_queue[0] if physical_exit_queue else None
         current_entry = entry_active.get("plate") if entry_active else None
 
     exit_words = (
@@ -1825,9 +1824,6 @@ def process_entry_queue():
 
 
 def schedule_exit(plate, planned_minutes):
-    """Schedule a request to use the exit approach. Only one car is allowed
-    to approach/occupy the exit at a time, so one payment problem cannot
-    create a pile-up at EXIT."""
     seconds = max(1, int(planned_minutes)) * 60
     log_decision(plate, "TIMER", f"Exit requested in {seconds}s")
     timer = threading.Timer(seconds, request_exit_lane, args=(plate,))
@@ -1836,64 +1832,19 @@ def schedule_exit(plate, planned_minutes):
 
 
 def request_exit_lane(plate):
-    global exit_lane_plate
     car = get_car(plate)
     if not car or car.get("status") not in ("PARKED", "WAITING_EXIT_LANE"):
         return
 
-    with state_lock:
-        if exit_lane_plate is None:
-            exit_lane_plate = plate
-            dispatch_now = True
-        else:
-            dispatch_now = False
-            if plate not in to_exit_queue:
-                to_exit_queue.append(plate)
-                upsert_car(plate, status="WAITING_EXIT_LANE")
-                log_decision(
-                    plate, "EXIT_QUEUE",
-                    f"Waiting safely in parking spot; exit is occupied by {exit_lane_plate}",
-                    "Exit-lane serialization prevents a queue collision."
-                )
-
-    if dispatch_now:
-        send_to_exit(plate)
-
-
-def dispatch_next_exit_lane():
-    global exit_lane_plate
-    next_plate = None
-    with state_lock:
-        if exit_lane_plate is not None:
-            return
-        while to_exit_queue:
-            candidate = to_exit_queue.pop(0)
-            car = get_car(candidate)
-            if car and car.get("status") in ("PARKED", "WAITING_EXIT_LANE"):
-                exit_lane_plate = candidate
-                next_plate = candidate
-                break
-
-    if next_plate:
-        threading.Thread(target=send_to_exit, args=(next_plate,), daemon=True).start()
-
-
-def send_to_exit(plate):
-    car = get_car(plate)
-    if not car or car["status"] not in ("PARKED", "WAITING_EXIT_LANE"):
-        return
+    upsert_car(plate, status="TO_EXIT")
+    
+    append_journey(plate, "sent_to_exit")
+    log_decision(plate, "TO_EXIT", "Vehicle driving to exit lane. Queuing enabled.")
+    
     try:
         send_car(plate, "exit")
-        upsert_car(plate, status="TO_EXIT")
-        append_journey(plate, "sent_to_exit")
     except Exception as e:
-        # Release lane ownership if the command itself failed.
-        global exit_lane_plate
-        with state_lock:
-            if exit_lane_plate == plate:
-                exit_lane_plate = None
         log_decision(plate, "ERROR", f"Could not send to exit: {e}")
-        dispatch_next_exit_lane()
 
 
 # =====================================================================
@@ -1967,7 +1918,7 @@ def verify_payment(plate, received_amount):
     factors.append("NOT_DOUBLE=✓")
 
     # Factor 4: status sanity
-    if car.get("status") not in ("AT_EXIT", "PAYMENT_PENDING", "WAITING_TO_CHARGE", "PAYMENT_HOLD"):
+    if car.get("status") not in ("AT_EXIT", "PAYMENT_PENDING", "WAITING_TO_CHARGE", "PAYMENT_HOLD", "TO_EXIT"):
         log_fraud(plate,
                   f"BAD_STATUS — status={car.get('status')}",
                   received_amount)
@@ -1978,149 +1929,77 @@ def verify_payment(plate, received_amount):
 
 
 def payment_timeout_watch(plate):
-    """If payment never resolves, keep the gate closed and keep later cars
-    parked in their bays instead of sending everyone into the exit lane."""
-    time.sleep(PAYMENT_TIMEOUT_SEC)
-    car = get_car(plate)
-    if not car:
-        return
-    if car.get("payment_status") in ("PAID",):
-        return
-    if car.get("status") not in ("AT_EXIT", "PAYMENT_PENDING"):
-        return
-
-    upsert_car(plate, status="PAYMENT_HOLD")
-    log_anomaly(
-        plate,
-        "PAYMENT_TIMEOUT",
-        f"No valid payment after {PAYMENT_TIMEOUT_SEC}s. Exit remains locked; following cars stay parked."
-    )
-    log_decision(
-        plate,
-        "PAYMENT_HOLD",
-        "Vehicle isolated at exit; automatic release blocked.",
-        "Fail-safe mode prevents unpaid escape and prevents other cars from piling into EXIT."
-    )
-
-    recovery = threading.Thread(
-        target=exit_lane_recovery_watch,
-        args=(plate,),
-        daemon=True
-    )
-    recovery.start()
-
-
-def exit_lane_recovery_watch(plate, hold_seconds=EXIT_HOLD_RECOVERY_SEC):
-    """
-    Prevent one unresolved payment from blocking the facility forever.
-
-    SAFETY: we do NOT simply clear exit_lane_plate while the unpaid car is
-    physically sitting at EXIT. First try to return that car to a safe parking
-    spot (normally its original spot). Only after the reroute command succeeds
-    do we free the exit lane for the next vehicle.
-
-    If no safe holding spot exists, keep PAYMENT_HOLD and require operator
-    intervention rather than creating an exit collision or unpaid escape.
-    """
-    global exit_lane_plate
-
-    time.sleep(hold_seconds)
+    """Keep trying to charge the car if it's waiting at the gate."""
+    time.sleep(EXIT_PAYMENT_RETRY_SEC)
     car = get_car(plate)
     if not car:
         return
     if car.get("payment_status") == "PAID":
         return
-    if car.get("status") not in ("PAYMENT_HOLD", "PAYMENT_PENDING", "AT_EXIT"):
+    if car.get("status") not in ("AT_EXIT", "PAYMENT_PENDING", "PAYMENT_HOLD", "TO_EXIT"):
         return
 
-    preferred = car.get("assigned_spot")
-    car_type = car.get("car_type") or "Normal"
-    hold_spot = None
-
-    # Prefer the original bay if it is now free and safe.
-    if preferred:
-        s = spots.get(preferred)
-        res = reserved_spots.get(preferred)
-        if (s and not s.get("occupied") and not s.get("broken")
-                and not s.get("isUnderMaintenance")
-                and compatible(s, car_type)
-                and (not res or res.get("plate") == plate)):
-            hold_spot = preferred
-
-    # Otherwise choose another safe free bay.
-    if not hold_spot:
-        hold_spot, reason = choose_spot(
-            car_type, int(car.get("planned_minutes") or 0)
-        )
-
-    if not hold_spot:
-        log_decision(
-            plate, "EXIT_LANE_ESCALATION",
-            "Payment unresolved and no safe holding bay exists.",
-            "Exit lane remains blocked; operator intervention required. "
-            "PARKMIND refuses to create a collision or unpaid escape."
-        )
-        return
-
+    # Retry the charge!
+    log_decision(
+        plate,
+        "PAYMENT_RETRY",
+        "Vehicle is still at exit gate; retrying charge.",
+        "Continuous flow requires cars to pay before leaving."
+    )
+    
+    expected = float(car.get("expected_amount") or 0)
+    parking_cost = float(car.get("parking_cost") or 0)
+    charging_cost = float(car.get("charging_cost") or 0)
+    
+    upsert_car(plate, payment_status="REQUESTED", status="PAYMENT_PENDING")
     try:
-        reserved_spots[hold_spot] = {"plate": plate, "reserved_at": time.time()}
-        send_car(plate, hold_spot)
-        upsert_car(
-            plate,
-            assigned_spot=hold_spot,
-            status="PAYMENT_HOLD_REPARKING"
-        )
-        append_journey(plate, f"payment_hold_repark->{hold_spot}")
-        log_decision(
-            plate, "EXIT_LANE_RECOVERY",
-            f"Unpaid vehicle rerouted from EXIT to {hold_spot}.",
-            "Clears the single exit approach without allowing unpaid departure."
-        )
-
-        try:
-            close_gate(EXIT_GATE)
-        except Exception:
-            pass
-
-        with state_lock:
-            if exit_lane_plate == plate:
-                exit_lane_plate = None
-
-        threading.Timer(1.0, dispatch_next_exit_lane).start()
-
+        charge_car(plate, parking_cost, charging_cost)
     except Exception as e:
-        reserved_spots.pop(hold_spot, None)
-        log_decision(
-            plate, "EXIT_LANE_RECOVERY_ERROR", str(e),
-            "Lane remains held; operator intervention required."
-        )
+        upsert_car(plate, payment_status="CHARGE_ERROR")
+        log_decision(plate, "CHARGE_ERROR", str(e))
+        
+    # Start the timeout watch again to keep retrying!
+    threading.Thread(target=payment_timeout_watch, args=(plate,), daemon=True).start()
 
 
-def process_exit_queue():
+def ensure_gate_open_and_leave(plate):
     global exit_active
     with state_lock:
-        if exit_active is not None or not exit_queue:
-            return
-        plate = exit_queue.pop(0)
+        state = str(gates.get(EXIT_GATE, {}).get("state") or "")
         exit_active = {"plate": plate, "sent": False}
-        try:
-            opened = open_gate(EXIT_GATE)
-            if opened is False:
-                raise RuntimeError(f"Exit gate {EXIT_GATE} failed safety/open check")
+        if state not in ("Opening", "Open"):
+            try:
+                open_gate(EXIT_GATE)
+                watchdog = threading.Timer(0.35, exit_gate_open_watchdog, args=(plate, 2))
+                watchdog.daemon = True
+                watchdog.start()
+                
+                release_fallback = threading.Timer(0.70, delayed_exit_release, args=(plate,))
+                release_fallback.daemon = True
+                release_fallback.start()
+            except Exception as e:
+                log_decision(plate, "ERROR", f"Exit release failed: {e}")
+        else:
+            try:
+                send_car(plate, "leavepark")
+                exit_active["sent"] = True
+                log_decision(plate, "EXIT_RELEASE", "Gate already open; releasing paid vehicle.")
+            except Exception as e:
+                log_decision(plate, "EXIT_RELEASE_ERROR", str(e))
+                release_fallback = threading.Timer(0.70, delayed_exit_release, args=(plate,))
+                release_fallback.daemon = True
+                release_fallback.start()
 
-            watchdog = threading.Timer(
-                0.65, exit_gate_open_watchdog, args=(plate, 2)
-            )
-            watchdog.daemon = True
-            watchdog.start()
-
-            release_fallback = threading.Timer(
-                1.20, delayed_exit_release, args=(plate,)
-            )
-            release_fallback.daemon = True
-            release_fallback.start()
-        except Exception as e:
-            log_decision(plate, "ERROR", f"Exit release failed: {e}")
+def close_exit_if_idle():
+    with state_lock:
+        if physical_exit_queue:
+            return
+        if exit_active is not None:
+            return
+    try:
+        close_gate(EXIT_GATE)
+    except Exception as e:
+        pass
 
 
 # =====================================================================
@@ -2150,9 +2029,6 @@ def entry_transit_watchdog():
                 continue
 
             elapsed = time.time() - float(sent_at)
-            if elapsed < ENTRY_TRANSIT_TIMEOUT_SEC:
-                continue
-
             spot = active["spot"]
             retries = int(active.get("route_retries") or 0)
 
@@ -2162,71 +2038,56 @@ def entry_transit_watchdog():
                     in_transit.pop(plate, None)
                 continue
 
-            if retries < ENTRY_TRANSIT_MAX_RETRIES:
-                try:
-                    send_car(plate, spot)
-                    with state_lock:
-                        if plate in in_transit:
-                            in_transit[plate]["route_retries"] = retries + 1
-                            in_transit[plate]["sent_at"] = time.time()
-
-                    log_decision(
-                        plate,
-                        "ENTRY_TRANSIT_RETRY",
-                        f"Re-sent route to {spot} ({retries + 1}/{ENTRY_TRANSIT_MAX_RETRIES})",
-                        f"No Park/CarIn confirmation after {ENTRY_TRANSIT_TIMEOUT_SEC}s."
-                    )
-                    with state_lock:
-                        stats["auto_recoveries"] += 1
-                    continue
-
-                except Exception as e:
-                    log_decision(
-                        plate,
-                        "ENTRY_TRANSIT_RETRY_ERROR",
-                        str(e),
-                        "This vehicle remains independently monitored; entrance flow continues."
-                    )
-                    with state_lock:
-                        if plate in in_transit:
-                            in_transit[plate]["sent_at"] = time.time()
-                    continue
-
-            # This one vehicle failed to reach its bay after bounded retries.
-            try:
-                send_car(plate, "leavepark")
-                log_decision(
-                    plate,
-                    "ENTRY_TRANSIT_ABORT",
-                    f"Vehicle failed to reach {spot}; redirected out after retries.",
-                    "Only this vehicle is isolated; other arrivals continue normally."
-                )
-            except Exception as e:
-                log_decision(
-                    plate,
-                    "ENTRY_TRANSIT_ABORT_ERROR",
-                    str(e),
-                    "Vehicle marked for operator recovery without blocking entry."
-                )
-
             with state_lock:
-                res = reserved_spots.get(spot)
-                if res and res.get("plate") == plate:
-                    reserved_spots.pop(spot, None)
+                is_at_entry = (entry_active and entry_active.get("plate") == plate)
 
-                in_transit.pop(plate, None)
+            if is_at_entry:
+                if elapsed < ENTRY_TRANSIT_TIMEOUT_SEC:
+                    continue
 
-                # Only clear entry_active if this same vehicle somehow never generated EntrySpot CarOut.
-                if entry_active and entry_active.get("plate") == plate:
-                    entry_active = None
+                if retries < ENTRY_TRANSIT_MAX_RETRIES:
+                    try:
+                        send_car(plate, spot)
+                        with state_lock:
+                            if plate in in_transit:
+                                in_transit[plate]["route_retries"] = retries + 1
+                                in_transit[plate]["sent_at"] = time.time()
+                        log_decision(plate, "ENTRY_TRANSIT_RETRY", f"Re-sent route to {spot} ({retries + 1}/{ENTRY_TRANSIT_MAX_RETRIES})")
+                        with state_lock:
+                            stats["auto_recoveries"] += 1
+                        continue
+                    except Exception as e:
+                        log_decision(plate, "ENTRY_TRANSIT_RETRY_ERROR", str(e))
+                        with state_lock:
+                            if plate in in_transit:
+                                in_transit[plate]["sent_at"] = time.time()
+                        continue
+                else:
+                    try:
+                        send_car(plate, "leavepark")
+                        log_decision(plate, "ENTRY_TRANSIT_ABORT", f"Vehicle stuck at entrance; redirected out.")
+                    except Exception as e:
+                        log_decision(plate, "ENTRY_TRANSIT_ABORT_ERROR", str(e))
+                    
+                    with state_lock:
+                        res = reserved_spots.get(spot)
+                        if res and res.get("plate") == plate:
+                            reserved_spots.pop(spot, None)
+                        in_transit.pop(plate, None)
+                        if entry_active and entry_active.get("plate") == plate:
+                            entry_active = None
 
-            upsert_car(
-                plate,
-                status="ENTRY_ABORTED",
-                decision=f"Did not confirm arrival at {spot} after transit retries."
-            )
-
-            threading.Timer(0.1, process_entry_queue).start()
+                    upsert_car(plate, status="ENTRY_ABORTED", decision=f"Stuck at entrance.")
+                    threading.Timer(0.1, process_entry_queue).start()
+            else:
+                if elapsed > 90:
+                    log_decision(plate, "TRANSIT_LOST", f"Car did not arrive at {spot} after 90s.")
+                    with state_lock:
+                        res = reserved_spots.get(spot)
+                        if res and res.get("plate") == plate:
+                            reserved_spots.pop(spot, None)
+                        in_transit.pop(plate, None)
+                    upsert_car(plate, status="LOST", decision="Lost in transit")
 
 
 
@@ -2318,7 +2179,7 @@ def stuck_state_watchdog():
 # WEBHOOK PROCESSING
 # =====================================================================
 def handle_event(data):
-    global entry_active, exit_active, exit_lane_plate
+    global entry_active, exit_active, physical_exit_queue
     event_class = data.get("EventClass")
 
     try:
@@ -2376,8 +2237,7 @@ def handle_event(data):
                             )
 
                 if name == EXIT_GATE and action == "Closed":
-                    if exit_active is None:
-                        threading.Thread(target=process_exit_queue, daemon=True).start()
+                    pass
 
         elif event_class == "car_spot_action":
             plate = data.get("CarPlateNumber")
@@ -2453,10 +2313,20 @@ def handle_event(data):
                     append_journey(plate, f"left_{spot_name}")
 
             elif spot_type == "ExitSpot" and direction == "CarIn":
+                with state_lock:
+                    if plate not in physical_exit_queue:
+                        physical_exit_queue.append(plate)
+                    is_front = (physical_exit_queue[0] == plate)
+                
                 car = get_car(plate)
-                if car and car.get("payment_status") in ("REQUESTED", "PAID"):
+                
+                if car and car.get("payment_status") == "PAID":
+                    if is_front:
+                        ensure_gate_open_and_leave(plate)
                     return
-
+                elif car and car.get("payment_status") in ("REQUESTED", "PAYMENT_HOLD", "PAYMENT_PENDING", "WAITING_TO_CHARGE"):
+                    return
+                    
                 minutes, parking_cost, charging_cost = calculate_charge(plate, server_time)
                 expected = parking_cost + charging_cost
                 upsert_car(
@@ -2477,7 +2347,7 @@ def handle_event(data):
                             f"electric={'yes' if charging_cost>0 else 'no'}")
 
                 def delayed_charge():
-                    time.sleep(1.2)
+                    time.sleep(0.1)
                     latest = get_car(plate)
                     if not latest or latest.get("payment_status") != "WAITING_TO_CHARGE":
                         return
@@ -2556,19 +2426,30 @@ def handle_event(data):
                                 dur_min = int(car.get("planned_minutes") or 1)
                             update_spot_stats(spot, dur_min, float(car.get("actual_paid") or 0))
 
-                    if exit_active and exit_active["plate"] == plate:
+                    if exit_active and exit_active.get("plate") == plate:
                         exit_active = None
-                        try:
-                            close_gate(EXIT_GATE)
-                        except Exception as e:
-                            log_decision(plate, "ERROR", f"Close exit gate failed: {e}")
-                        threading.Timer(1.0, process_exit_queue).start()
-
-                    # The physical exit approach is now clear. Only now may the
-                    # next waiting parked car be released toward EXIT.
-                    if exit_lane_plate == plate:
-                        exit_lane_plate = None
-                        threading.Timer(1.0, dispatch_next_exit_lane).start()
+                    
+                    next_car = None
+                    with state_lock:
+                        if plate in physical_exit_queue:
+                            physical_exit_queue.remove(plate)
+                        if physical_exit_queue:
+                            next_car = physical_exit_queue[0]
+                    
+                    if next_car:
+                        car = get_car(next_car)
+                        if car and car.get("payment_status") == "PAID":
+                            ensure_gate_open_and_leave(next_car)
+                        elif car and car.get("payment_status") != "PAID":
+                            expected = float(car.get("expected_amount") or 0)
+                            parking_cost = float(car.get("parking_cost") or 0)
+                            charging_cost = float(car.get("charging_cost") or 0)
+                            try:
+                                charge_car(next_car, parking_cost, charging_cost)
+                            except Exception:
+                                pass
+                    else:
+                        threading.Timer(1.2, close_exit_if_idle).start()
 
         elif event_class == "payment_made":
             plate = data.get("CarPlateNumber")
@@ -2584,9 +2465,8 @@ def handle_event(data):
                              f"Expected matches received={received}",
                              f"FACTORS: {factors}")
                 with state_lock:
-                    if plate not in exit_queue and not (exit_active and exit_active["plate"] == plate):
-                        exit_queue.append(plate)
-                process_exit_queue()
+                    if physical_exit_queue and physical_exit_queue[0] == plate:
+                        ensure_gate_open_and_leave(plate)
             else:
                 upsert_car(
                     plate,
@@ -3319,7 +3199,7 @@ def dashboard():
         decisions=decisions, spot_analytics=spot_analytics,
         stats=snapshot_stats,
         entry_gate=ENTRY_GATE, exit_gate=EXIT_GATE,
-        exit_waiting=len(to_exit_queue),
+        exit_waiting=0,
         zone_rows=zone_rows,
         arrival_bars=arrival_bars,
         is_admin=require_admin(),
