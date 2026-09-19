@@ -139,7 +139,7 @@ def sim_login():
     global token
     r = requests.post(
         f"{SIM_BASE}/auth/login",
-        json={"email": SIM_USER, "password": SIM_PASSWORD},
+        json={"Email": SIM_USER, "Password": SIM_PASSWORD},
         timeout=5
     )
     r.raise_for_status()
