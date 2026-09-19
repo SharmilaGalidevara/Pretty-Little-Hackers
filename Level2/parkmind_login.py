@@ -38,23 +38,10 @@ WEB_PORT = int(os.getenv("PARKMIND_PORT", "8000"))
 DAY_START_HOUR = int(os.getenv("PARKMIND_DAY_START", "6"))
 DAY_END_HOUR = int(os.getenv("PARKMIND_DAY_END", "18"))
 
-# Preventive-maintenance policy thresholds.
-# These are PARKMIND policy settings, not fabricated simulator readings.
-MAINT_CYCLES = {
-    "spot": int(os.getenv("PARKMIND_SPOT_MAINT_CYCLES", "20")),
-    "gate": int(os.getenv("PARKMIND_GATE_MAINT_CYCLES", "30")),
-    "fan": int(os.getenv("PARKMIND_FAN_MAINT_CYCLES", "20")),
-    "light": int(os.getenv("PARKMIND_LIGHT_MAINT_CYCLES", "50")),
-}
-MAINT_RUNTIME_SECONDS = {
-    "fan": int(os.getenv("PARKMIND_FAN_MAINT_RUNTIME", "1800")),
-    "light": int(os.getenv("PARKMIND_LIGHT_MAINT_RUNTIME", "3600")),
-}
-
 # Configured tariff used to calculate the amount sent to the simulator.
 # Durations themselves always come from simulator timestamps.
 PARKING_RATE_PER_MIN = float(os.getenv("PARKMIND_PARKING_RATE", "1"))
-EV_CHARGING_RATE_PER_MIN = float(os.getenv("PARKMIND_EV_CHARGING_RATE", "1"))
+ELECTRIC_TOTAL_MULTIPLIER = float(os.getenv("PARKMIND_ELECTRIC_TOTAL_MULTIPLIER", "2"))
 
 app = Flask(__name__)
 app.secret_key = os.getenv(
@@ -77,10 +64,52 @@ last_sequence_lock = threading.Lock()
 
 entry_queues = defaultdict(list)          # gate -> [{plate, spot}]
 entry_active = {}                         # gate -> {plate, spot, sent}
-paid_exit_queues = defaultdict(list)      # gate -> [plate]
+paid_exit_queues = defaultdict(list)      # gate -> [PAID plates ready for gate release]
 exit_active = {}                          # gate -> {plate, sent}
-exit_request_queue = []                   # parked cars waiting to approach exit
+
+# Physical queue at each REAL ExitSpot sensor.
+# This follows the supplied reference payment method, upgraded for Level 2:
+# cars may physically queue at an exit, but ONLY the front car can be released.
+physical_exit_queues = defaultdict(list)  # ExitSpot name -> [plate, plate, ...]
+
+# Cars currently travelling into each real API-reported parking zone.
+# Key = Park bay zoneParent. No zone names are hardcoded.
+zone_access_users = defaultdict(set)
+
+exit_request_queue = []                   # parked cars waiting to approach an API ExitSpot
 scheduled_exit_plates = set()
+
+# Level-1-compatible physical flow protection for Level 2.
+# We learn which barrier belongs to each EntrySpot / ExitSpot from real
+# simulator topology + successful physical crossings. No hard-coded gate names.
+ROUTE_RELEASE_FALLBACK_SEC = 0.80
+LANE_DISCOVERY_TIMEOUT_SEC = 4.00
+ENTRY_IDLE_RESTORE_GRACE_SEC = 1.5
+EXIT_PAYMENT_RETRY_SEC = 2.0
+
+# Software reservations protect a bay while a car travels from EntrySpot to
+# the actual parking sensor. They must not survive forever after a failed route
+# or simulator restart.
+RESERVATION_TTL_SECONDS = 45
+
+lane_trial_lock = threading.RLock()
+topology_sync_lock = threading.RLock()
+
+# First /list-barriers snapshot seen in THIS PARKMIND process.
+# This is API-derived, not hardcoded. It protects simulator road topology:
+# a barrier that the simulator loaded Open is never auto-closed by discovery.
+gate_initial_api_state = {}
+
+# ============================================================
+# REAL LEVEL 2 TOPOLOGY — API-ONLY
+# ============================================================
+# The simulator API proves:
+# - parking/entry/exit sensor purpose from /list-parking-spots
+# - parking/exit zoneParent
+# - barrier name, zoneParent, state, broken, isUnderMaintenance
+#
+# It does NOT expose a barrier role (entry/exit) and EntrySpot rows do not
+# expose a zone association. PARKMIND therefore does not invent those fields.
 
 LOGIN_HTML = """
 <!doctype html>
@@ -157,6 +186,8 @@ def init_db():
         exit_zone TEXT,
         exit_gate TEXT,
         departure_time TEXT,
+        total_stay_seconds INTEGER DEFAULT 0,
+        total_stay_minutes INTEGER DEFAULT 0,
         billable_seconds INTEGER DEFAULT 0,
         billable_minutes INTEGER DEFAULT 0,
         parking_cost REAL DEFAULT 0,
@@ -185,6 +216,15 @@ def init_db():
         cycles INTEGER DEFAULT 0,
         runtime_seconds INTEGER DEFAULT 0,
         on_since TEXT,
+        maintenance_required INTEGER DEFAULT 0,
+        maintenance_problem TEXT,
+        api_life_pct REAL,
+        api_life_source TEXT,
+        api_usage_current REAL,
+        api_usage_limit REAL,
+        api_runtime_hours REAL,
+        api_runtime_limit_hours REAL,
+        last_alarm_time TEXT,
         last_event_time TEXT,
         raw_json TEXT,
         PRIMARY KEY(name, kind)
@@ -195,6 +235,16 @@ def init_db():
         role TEXT,
         zone TEXT,
         source TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS lane_map(
+        sensor TEXT,
+        role TEXT,
+        gate TEXT,
+        confidence TEXT,
+        source TEXT,
+        updated_at TEXT,
+        PRIMARY KEY(sensor, role)
     );
 
     CREATE TABLE IF NOT EXISTS zones(
@@ -256,9 +306,56 @@ def init_db():
         kind TEXT,
         reason TEXT,
         action TEXT,
-        result TEXT
+        result TEXT,
+        repair_type TEXT,
+        status TEXT DEFAULT 'PENDING',
+        completed_simulator_time TEXT,
+        repair_duration_seconds INTEGER DEFAULT 0,
+        repair_cost REAL,
+        cost_source TEXT
     );
     """)
+
+    # Safe car migrations for databases created by earlier Level 2 builds.
+    car_cols = {r[1] for r in conn.execute("PRAGMA table_info(cars)").fetchall()}
+    car_migrations = {
+        "total_stay_seconds": "INTEGER DEFAULT 0",
+        "total_stay_minutes": "INTEGER DEFAULT 0",
+    }
+    for col, ddl in car_migrations.items():
+        if col not in car_cols:
+            conn.execute(f"ALTER TABLE cars ADD COLUMN {col} {ddl}")
+
+    # Safe migrations for databases created by earlier Level 2 builds.
+    component_cols = {r[1] for r in conn.execute("PRAGMA table_info(components)").fetchall()}
+    component_migrations = {
+        "maintenance_required": "INTEGER DEFAULT 0",
+        "maintenance_problem": "TEXT",
+        "api_life_pct": "REAL",
+        "api_life_source": "TEXT",
+        "api_usage_current": "REAL",
+        "api_usage_limit": "REAL",
+        "api_runtime_hours": "REAL",
+        "api_runtime_limit_hours": "REAL",
+        "last_alarm_time": "TEXT",
+    }
+    for col, ddl in component_migrations.items():
+        if col not in component_cols:
+            conn.execute(f"ALTER TABLE components ADD COLUMN {col} {ddl}")
+
+    action_cols = {r[1] for r in conn.execute("PRAGMA table_info(maintenance_actions)").fetchall()}
+    action_migrations = {
+        "repair_type": "TEXT",
+        "status": "TEXT DEFAULT 'PENDING'",
+        "completed_simulator_time": "TEXT",
+        "repair_duration_seconds": "INTEGER DEFAULT 0",
+        "repair_cost": "REAL",
+        "cost_source": "TEXT",
+    }
+    for col, ddl in action_migrations.items():
+        if col not in action_cols:
+            conn.execute(f"ALTER TABLE maintenance_actions ADD COLUMN {col} {ddl}")
+
     conn.commit()
     conn.close()
 
@@ -471,6 +568,84 @@ def detected_count(value):
         return 0
 
 
+def _num(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _first_ci(item, keys):
+    lowered = {str(k).lower(): v for k, v in (item or {}).items()}
+    for key in keys:
+        if key.lower() in lowered:
+            return lowered[key.lower()]
+    return None
+
+
+def extract_simulator_maintenance_metrics(item):
+    """
+    Only uses fields returned by the simulator API.
+
+    If the simulator exposes a direct life/health percentage, use it.
+    Otherwise, a remaining-life percentage is calculated ONLY when the
+    simulator itself exposes both current usage and its limit, or both
+    runtime and its limit. If neither exists, life remains None.
+    """
+    direct_life = _num(_first_ci(item, [
+        "remainingLifePercent", "remainingLifePercentage",
+        "lifePercent", "lifePercentage",
+        "healthPercent", "healthPercentage"
+    ]))
+
+    usage_current = _num(_first_ci(item, [
+        "usageCount", "usedCycles", "cycleCount", "cycles",
+        "currentCycles", "workCycles"
+    ]))
+    usage_limit = _num(_first_ci(item, [
+        "maxUsageCount", "maxCycles", "cycleLimit", "usageLimit",
+        "maintenanceAfterCycles", "repairAfterCycles"
+    ]))
+
+    runtime_hours = _num(_first_ci(item, [
+        "usageHours", "runningHours", "runtimeHours",
+        "workingHours", "workedHours"
+    ]))
+    runtime_limit_hours = _num(_first_ci(item, [
+        "maxUsageHours", "maxRunningHours", "runtimeLimitHours",
+        "maintenanceAfterHours", "repairAfterHours"
+    ]))
+
+    candidates = []
+    source_parts = []
+
+    if direct_life is not None:
+        candidates.append(max(0.0, min(100.0, direct_life)))
+        source_parts.append("API percentage")
+
+    if usage_current is not None and usage_limit and usage_limit > 0:
+        remaining = 100.0 * (1.0 - usage_current / usage_limit)
+        candidates.append(max(0.0, min(100.0, remaining)))
+        source_parts.append("API cycles/limit")
+
+    if runtime_hours is not None and runtime_limit_hours and runtime_limit_hours > 0:
+        remaining = 100.0 * (1.0 - runtime_hours / runtime_limit_hours)
+        candidates.append(max(0.0, min(100.0, remaining)))
+        source_parts.append("API runtime/limit")
+
+    life = min(candidates) if candidates else None
+    return {
+        "api_life_pct": round(life, 1) if life is not None else None,
+        "api_life_source": " + ".join(source_parts) if source_parts else None,
+        "api_usage_current": usage_current,
+        "api_usage_limit": usage_limit,
+        "api_runtime_hours": runtime_hours,
+        "api_runtime_limit_hours": runtime_limit_hours,
+    }
+
+
 def upsert_component(kind, item, sim_time=None):
     name = str(item.get("name") or item.get("Name") or "").strip()
     if not name:
@@ -485,9 +660,12 @@ def upsert_component(kind, item, sim_time=None):
             state = "Occupied" if detected_count(item.get("detectedCars")) > 0 else "Free"
         else:
             state = purpose or state or "Sensor"
+    elif kind in ("fan", "light") and "isOn" in item:
+        state = "On" if bool(item.get("isOn")) else "Off"
 
     broken = 1 if item.get("broken", False) else 0
     under = 1 if item.get("isUnderMaintenance", False) else 0
+    api_metrics = extract_simulator_maintenance_metrics(item)
 
     conn = db()
     existing = conn.execute(
@@ -501,24 +679,332 @@ def upsert_component(kind, item, sim_time=None):
     conn.execute(
         """INSERT INTO components(
             name,kind,zone,state,broken,under_maintenance,cycles,
-            runtime_seconds,on_since,last_event_time,raw_json
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            runtime_seconds,on_since,
+            api_life_pct,api_life_source,api_usage_current,api_usage_limit,
+            api_runtime_hours,api_runtime_limit_hours,
+            last_event_time,raw_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(name,kind) DO UPDATE SET
             zone=excluded.zone,
             state=excluded.state,
             broken=excluded.broken,
             under_maintenance=excluded.under_maintenance,
+            api_life_pct=excluded.api_life_pct,
+            api_life_source=excluded.api_life_source,
+            api_usage_current=excluded.api_usage_current,
+            api_usage_limit=excluded.api_usage_limit,
+            api_runtime_hours=excluded.api_runtime_hours,
+            api_runtime_limit_hours=excluded.api_runtime_limit_hours,
             last_event_time=excluded.last_event_time,
             raw_json=excluded.raw_json""",
         (
             name, kind, zone, str(state), broken, under,
             cycles, runtime, on_since,
+            api_metrics["api_life_pct"],
+            api_metrics["api_life_source"],
+            api_metrics["api_usage_current"],
+            api_metrics["api_usage_limit"],
+            api_metrics["api_runtime_hours"],
+            api_metrics["api_runtime_limit_hours"],
             sim_time or simulator_now() or None,
             json.dumps(item)
         )
     )
     conn.commit()
     conn.close()
+
+
+def _purpose_from_component_row(row):
+    try:
+        raw = json.loads(row["raw_json"] or "{}")
+    except Exception:
+        raw = {}
+    return str(raw.get("purpose") or "")
+
+
+def topology_counts():
+    conn = db()
+    rows = conn.execute(
+        "SELECT name,raw_json FROM components WHERE kind='spot'"
+    ).fetchall()
+    gates = conn.execute(
+        "SELECT COUNT(*) AS n FROM components WHERE kind='gate'"
+    ).fetchone()["n"]
+    zone_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM zones"
+    ).fetchone()["n"]
+    conn.close()
+
+    park = entry = exit_spot = leave = 0
+    for row in rows:
+        try:
+            raw = json.loads(row["raw_json"] or "{}")
+        except Exception:
+            raw = {}
+        purpose = str(raw.get("purpose") or "")
+        if purpose == "Park":
+            park += 1
+        elif purpose == "EntrySpot":
+            entry += 1
+        elif purpose == "ExitSpot":
+            exit_spot += 1
+        elif purpose == "LeaveParking":
+            leave += 1
+
+    return {
+        "park": park,
+        "entry": entry,
+        "exit": exit_spot,
+        "leave": leave,
+        "gates": int(gates or 0),
+        "zones": int(zone_count or 0),
+    }
+
+
+def level2_topology_ready():
+    """
+    Dynamic readiness check.
+
+    No fixed number of zones, bays, gates, EntrySpots or ExitSpots is assumed.
+    PARKMIND is ready when the simulator API has exposed the component classes
+    required for normal parking flow.
+    """
+    counts = topology_counts()
+    return (
+        counts["park"] > 0
+        and counts["entry"] > 0
+        and counts["exit"] > 0
+        and counts["gates"] > 0
+        and counts["zones"] > 0
+    )
+
+
+def ensure_level2_topology_ready(reason="runtime"):
+    """
+    Makes Level 2 robust to startup order.
+
+    PARKMIND may be started before the Level 2 map is loaded. The first signed
+    EntrySpot/ExitSpot event proves the simulator is live, so at that point we
+    perform one defensive topology sync if the required component classes have
+    not yet been discovered.
+    """
+    if level2_topology_ready():
+        return True
+
+    with topology_sync_lock:
+        if level2_topology_ready():
+            return True
+        sync_topology(f"lazy:{reason}")
+        return level2_topology_ready()
+
+
+def prune_stale_components(loaded):
+    """Remove components left over from another simulator level."""
+    conn = db()
+    for kind in ("spot", "gate", "light", "fan", "alarm"):
+        if kind == "alarm":
+            continue
+        names = [
+            str(item.get("name") or item.get("Name") or "").strip()
+            for item in loaded.get(kind, [])
+            if str(item.get("name") or item.get("Name") or "").strip()
+        ]
+        if names:
+            placeholders = ",".join("?" for _ in names)
+            conn.execute(
+                f"DELETE FROM components WHERE kind=? AND name NOT IN ({placeholders})",
+                [kind] + names
+            )
+        else:
+            conn.execute("DELETE FROM components WHERE kind=?", (kind,))
+
+    # Remove learned mappings that point to barriers no longer in this level.
+    conn.execute(
+        """DELETE FROM lane_map
+           WHERE gate NOT IN(
+             SELECT name FROM components WHERE kind='gate'
+           )"""
+    )
+    conn.execute(
+        """DELETE FROM gate_roles
+           WHERE name NOT IN(
+             SELECT name FROM components WHERE kind='gate'
+           )"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def apply_alarm_snapshot(alarms, reason="api", sim_time=None):
+    sim_time = sim_time or simulator_now() or None
+    names = set()
+    conn = db()
+
+    # Clear only the simulator-maintenance recommendation flag.
+    conn.execute(
+        """UPDATE components
+           SET maintenance_required=0, maintenance_problem=NULL
+           WHERE broken=0 AND under_maintenance=0"""
+    )
+
+    for alarm in alarms or []:
+        name = str(alarm.get("name") or alarm.get("Name") or "").strip()
+        problem = str(alarm.get("problem") or alarm.get("Problem") or "Require Maintenance").strip()
+        if not name:
+            continue
+        names.add(name)
+        cur = conn.execute(
+            """UPDATE components
+               SET maintenance_required=1,
+                   maintenance_problem=?,
+                   last_alarm_time=?
+               WHERE name=?""",
+            (problem, sim_time, name)
+        )
+        if cur.rowcount:
+            conn.execute(
+                """INSERT INTO alerts(
+                    alert_key,created_at,simulator_time,severity,alert_type,
+                    plate,zone,component,reason,active
+                )
+                SELECT ?,?,?,?,?, '',zone,name,?,1
+                FROM components WHERE name=? LIMIT 1
+                ON CONFLICT(alert_key) DO UPDATE SET
+                    simulator_time=excluded.simulator_time,
+                    severity=excluded.severity,
+                    alert_type=excluded.alert_type,
+                    zone=excluded.zone,
+                    component=excluded.component,
+                    reason=excluded.reason,
+                    active=1,
+                    resolved_at=NULL""",
+                (
+                    f"MAINT_DUE:{name}",
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    sim_time,
+                    "HIGH",
+                    "SIMULATOR MAINTENANCE REQUIRED",
+                    problem,
+                    name
+                )
+            )
+
+    # Resolve old due alerts that are no longer in the authoritative alarm snapshot.
+    due_rows = conn.execute(
+        "SELECT name FROM components WHERE maintenance_required=0"
+    ).fetchall()
+    for row in due_rows:
+        conn.execute(
+            "UPDATE alerts SET active=0,resolved_at=? WHERE alert_key=?",
+            (sim_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+             f"MAINT_DUE:{row['name']}")
+        )
+
+    conn.commit()
+    conn.close()
+    audit("system", "MAINTENANCE_ALARM_SYNC", reason, f"alarms={len(alarms or [])}", "OK", sim_time)
+
+
+def refresh_maintenance_snapshot(reason="manual"):
+    """
+    Manual/cost-aware maintenance refresh.
+
+    The simulator documentation discourages periodic list-* polling, so this is
+    NOT a background poll. It is called at level load or explicitly by an
+    authorized Admin/Maintenance user.
+    """
+    sync_topology(reason)
+
+
+def capture_gate_api_baseline(barrier_items):
+    """
+    Capture the simulator's first API-reported barrier state for this run.
+
+    /list-barriers does not expose road connectivity or entry/exit roles.
+    Therefore PARKMIND preserves the simulator's own initial Open/Closed state
+    instead of assuming an unknown gate is safe to close.
+    """
+    with state_lock:
+        for item in barrier_items or []:
+            name = str(item.get("name") or item.get("Name") or "").strip()
+            if not name or name in gate_initial_api_state:
+                continue
+
+            state = str(item.get("state") or item.get("State") or "").strip()
+            if state:
+                gate_initial_api_state[name] = state
+
+    if barrier_items:
+        snapshot = ", ".join(
+            f"{name}={state}"
+            for name, state in sorted(gate_initial_api_state.items())
+        )
+        print(f"[GATE API BASELINE] {snapshot}")
+
+
+def gate_api_baseline(name):
+    with state_lock:
+        return str(gate_initial_api_state.get(name) or "")
+
+
+def auto_restore_gate_api_baseline(name, actor="system", sim_time=None):
+    """
+    Restore only the state proved by the FIRST /list-barriers snapshot.
+
+    Crucially:
+      - baseline Open  -> PARKMIND will NOT auto-close it
+      - baseline Closed -> PARKMIND may close it after temporary use
+
+    This prevents automatic lane-discovery cleanup from cutting an unknown
+    simulator road and causing 'No path from A to P2'.
+    """
+    baseline = gate_api_baseline(name)
+    row = component_row(name, "gate") or {}
+    current = str(row.get("state") or "")
+
+    if not baseline:
+        audit(
+            actor,
+            "GATE_BASELINE_SKIP",
+            name,
+            "No initial API state was captured; automatic state change skipped.",
+            "SKIPPED",
+            sim_time or simulator_now()
+        )
+        return False
+
+    base = baseline.lower()
+    cur = current.lower()
+
+    if base in ("open", "opening"):
+        # Never auto-close a gate that the simulator initially exposed Open.
+        if cur not in ("open", "opening"):
+            component_action("gate", name, "open", actor, sim_time)
+        else:
+            audit(
+                actor,
+                "GATE_BASELINE_PRESERVED",
+                name,
+                f"Initial API state={baseline}; leaving gate open.",
+                "OK",
+                sim_time or simulator_now()
+            )
+        return True
+
+    if base in ("closed", "closing"):
+        if cur not in ("closed", "closing"):
+            component_action("gate", name, "close", actor, sim_time)
+        return True
+
+    audit(
+        actor,
+        "GATE_BASELINE_SKIP",
+        name,
+        f"Unsupported initial API state={baseline!r}; automatic state change skipped.",
+        "SKIPPED",
+        sim_time or simulator_now()
+    )
+    return False
 
 
 def sync_topology(reason="startup"):
@@ -535,11 +1021,20 @@ def sync_topology(reason="startup"):
         try:
             data = sim_request("GET", endpoint).json()
             loaded[kind] = data if isinstance(data, list) else []
-            for item in loaded[kind]:
-                upsert_component(kind, item)
+            if kind != "alarm":
+                for item in loaded[kind]:
+                    upsert_component(kind, item)
         except Exception as e:
             loaded[kind] = []
             audit("system", "TOPOLOGY_SYNC_ERROR", kind, str(e), "ERROR")
+
+    # Preserve the simulator's own barrier topology state before PARKMIND
+    # performs any automatic gate operation.
+    capture_gate_api_baseline(loaded.get("gate", []))
+
+    # /list-alarms is the documented simulator source for components that
+    # require maintenance. We do not invent a threshold.
+    apply_alarm_snapshot(loaded.get("alarm", []), reason=f"sync:{reason}")
 
     try:
         zone_data = sim_request("GET", "/list-zones").json()
@@ -559,55 +1054,58 @@ def sync_topology(reason="startup"):
     except Exception as e:
         audit("system", "ZONE_SYNC_ERROR", "", str(e), "ERROR")
 
+    prune_stale_components(loaded)
     infer_gate_roles()
-    set_state("topology_loaded", "1")
-    audit("system", "TOPOLOGY_SYNC", reason,
-          ", ".join(f"{k}={len(v)}" for k, v in loaded.items()))
+    print_lane_discovery()
+
+    counts = topology_counts()
+    ready = level2_topology_ready()
+    set_state("topology_loaded", "1" if ready else "0")
+
+    print(
+        "[LEVEL2 TOPOLOGY] "
+        f"Park={counts['park']} Entry={counts['entry']} "
+        f"Exit={counts['exit']} LeaveParking={counts['leave']} Gates={counts['gates']}"
+    )
+    if ready:
+        print("[LEVEL2 TOPOLOGY] READY: exact Level 2 parking topology detected.")
+    else:
+        print("[LEVEL2 TOPOLOGY] NOT READY: waiting for the Level 2 map to finish loading.")
+
+    audit(
+        "system", "TOPOLOGY_SYNC", reason,
+        ", ".join(f"{k}={len(v)}" for k, v in loaded.items())
+        + f"; ready={ready}; counts={counts}"
+    )
 
 
 def infer_gate_roles():
+    """
+    The Level 2 /list-barriers API has no role field.
+    Keep every barrier role UNKNOWN unless a physical lane mapping is learned
+    from real simulator behaviour. Do not infer 'entry' or 'exit' from names.
+    """
     conn = db()
     gates = [dict(r) for r in conn.execute(
-        "SELECT name,zone,raw_json FROM components WHERE kind='gate'"
-    ).fetchall()]
-    spots = [dict(r) for r in conn.execute(
-        "SELECT name,zone,raw_json FROM components WHERE kind='spot'"
+        "SELECT name,zone FROM components WHERE kind='gate'"
     ).fetchall()]
 
-    zone_purposes = defaultdict(set)
-    for row in spots:
-        try:
-            raw = json.loads(row["raw_json"] or "{}")
-        except Exception:
-            raw = {}
-        purpose = str(raw.get("purpose") or "")
-        if purpose:
-            zone_purposes[row["zone"]].add(purpose)
-
-    for g in gates:
-        name_lower = g["name"].lower()
-        role = "unknown"
-        source = "unresolved"
-
-        if any(x in name_lower for x in ("entry", "entrance", "inbound", "gatein")):
-            role, source = "entry", "name"
-        elif any(x in name_lower for x in ("exit", "outbound", "gateout")):
-            role, source = "exit", "name"
-        else:
-            same_zone = [x for x in gates if x["zone"] == g["zone"]]
-            purposes = zone_purposes.get(g["zone"], set())
-            if len(same_zone) == 1 and "EntrySpot" in purposes and "ExitSpot" not in purposes:
-                role, source = "entry", "zone-purpose"
-            elif len(same_zone) == 1 and "ExitSpot" in purposes and "EntrySpot" not in purposes:
-                role, source = "exit", "zone-purpose"
-
+    for gate in gates:
         conn.execute(
             """INSERT INTO gate_roles(name,role,zone,source)
                VALUES(?,?,?,?)
                ON CONFLICT(name) DO UPDATE SET
-                 role=excluded.role,zone=excluded.zone,source=excluded.source""",
-            (g["name"], role, g["zone"], source)
+                 role=excluded.role,
+                 zone=excluded.zone,
+                 source=excluded.source""",
+            (
+                gate["name"],
+                "unknown",
+                gate.get("zone") or "",
+                "api-does-not-expose-role"
+            )
         )
+
     conn.commit()
     conn.close()
 
@@ -629,50 +1127,192 @@ def component_row(name, kind=None):
 
 
 def sensor_zone(sensor_name):
+    """
+    Return only the zoneParent actually exposed by the simulator API.
+    EntrySpot rows currently return an empty zoneParent, so this returns ""
+    rather than inventing an EntrySpot→Zone mapping.
+    """
     row = component_row(sensor_name, "spot")
     return row.get("zone", "") if row else ""
 
 
-def gate_for_sensor(sensor_name, role):
-    zone = sensor_zone(sensor_name)
+def _number_suffix(value):
+    m = re.search(r"(\d+)$", str(value or ""))
+    return int(m.group(1)) if m else None
+
+
+def remember_lane_mapping(sensor_name, role, gate, confidence="CONFIRMED", source="physical-crossing"):
+    """Persist a sensor→barrier mapping learned from actual simulator behaviour."""
+    if not sensor_name or not role or not gate:
+        return
     conn = db()
-
-    # First use a confidently inferred gate role in the same zone.
-    rows = conn.execute(
-        """SELECT g.name
-           FROM gate_roles g
-           JOIN components c ON c.name=g.name AND c.kind='gate'
-           WHERE g.role=? AND g.zone=?
-             AND c.broken=0 AND c.under_maintenance=0""",
-        (role, zone)
-    ).fetchall()
-    if len(rows) == 1:
-        conn.close()
-        return rows[0]["name"]
-
-    # If the zone has exactly one healthy barrier, using it is not an invented mapping.
-    rows = conn.execute(
-        """SELECT name FROM components
-           WHERE kind='gate' AND zone=? AND broken=0 AND under_maintenance=0""",
-        (zone,)
-    ).fetchall()
-    if len(rows) == 1:
-        conn.close()
-        return rows[0]["name"]
-
-    # Last safe fallback: exactly one gate of this role in the whole topology.
-    rows = conn.execute(
-        """SELECT g.name
-           FROM gate_roles g
-           JOIN components c ON c.name=g.name AND c.kind='gate'
-           WHERE g.role=? AND c.broken=0 AND c.under_maintenance=0""",
-        (role,)
-    ).fetchall()
+    conn.execute(
+        """INSERT INTO lane_map(sensor,role,gate,confidence,source,updated_at)
+           VALUES(?,?,?,?,?,?)
+           ON CONFLICT(sensor,role) DO UPDATE SET
+             gate=excluded.gate,
+             confidence=excluded.confidence,
+             source=excluded.source,
+             updated_at=excluded.updated_at""",
+        (
+            sensor_name,
+            role,
+            gate,
+            confidence,
+            source,
+            simulator_now() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+    )
+    conn.commit()
     conn.close()
-    if len(rows) == 1:
-        return rows[0]["name"]
+    audit(
+        "system", "LANE_MAP_LEARNED", sensor_name,
+        f"{role} sensor -> {gate}; confidence={confidence}; source={source}",
+        "OK", simulator_now()
+    )
 
+
+def learned_gate_for_sensor(sensor_name, role):
+    conn = db()
+    row = conn.execute(
+        """SELECT m.gate
+           FROM lane_map m
+           JOIN components c ON c.name=m.gate AND c.kind='gate'
+           WHERE m.sensor=? AND m.role=?
+             AND c.broken=0 AND c.under_maintenance=0
+           LIMIT 1""",
+        (sensor_name, role)
+    ).fetchone()
+    conn.close()
+    return row["gate"] if row else None
+
+
+def candidate_gates_for_sensor(sensor_name, role):
+    """
+    API-only barrier discovery.
+
+    Priority:
+    1) a sensor→gate mapping already CONFIRMED by real physical simulator events
+    2) healthy barriers whose API zoneParent matches the sensor zoneParent
+    3) other healthy barriers as deterministic discovery fallbacks
+
+    No barrier is labelled entry/exit from its name or number.
+    """
+    learned = learned_gate_for_sensor(sensor_name, role)
+    sensor_zone_name = sensor_zone(sensor_name)
+
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        """SELECT name,zone,state,broken,under_maintenance
+           FROM components
+           WHERE kind='gate'
+             AND broken=0
+             AND under_maintenance=0"""
+    ).fetchall()]
+    conn.close()
+
+    ranked = []
+    for row in rows:
+        gate = row["name"]
+        score = 0
+        reasons = []
+
+        if learned and gate == learned:
+            score += 100000
+            reasons.append("PHYSICALLY_CONFIRMED")
+
+        if sensor_zone_name and row.get("zone") == sensor_zone_name:
+            score += 1000
+            reasons.append("API_SAME_ZONE")
+        elif sensor_zone_name and not row.get("zone"):
+            score += 100
+            reasons.append("API_NO_ZONE_FALLBACK")
+
+        # For an unzoned EntrySpot, prefer gates already Closed so discovery
+        # does not disturb barriers the simulator intentionally loaded Open.
+        if not sensor_zone_name:
+            state = str(row.get("state") or "").lower()
+            if state == "closed":
+                score += 50
+                reasons.append("API_STATE_CLOSED")
+            elif state == "open":
+                score -= 25
+                reasons.append("API_STATE_OPEN_PRESERVE")
+
+        ranked.append((score, gate, "+".join(reasons) or "API_HEALTHY_GATE"))
+
+    ranked.sort(key=lambda x: (-x[0], x[1]))
+    return ranked
+
+
+def gate_for_sensor(sensor_name, role):
+    """Return the best currently-known real barrier for this sensor."""
+    learned = learned_gate_for_sensor(sensor_name, role)
+    if learned:
+        return learned
+
+    candidates = candidate_gates_for_sensor(sensor_name, role)
+    return candidates[0][1] if candidates else None
+
+
+def find_active_entry_gate(plate):
+    with state_lock:
+        for gate, item in entry_active.items():
+            if item.get("plate") == plate:
+                return gate
     return None
+
+
+def find_active_exit_gate(plate):
+    with state_lock:
+        for gate, item in exit_active.items():
+            if item.get("plate") == plate:
+                return gate
+    return None
+
+
+def print_lane_discovery():
+    counts = topology_counts()
+
+    conn = db()
+    sensor_rows = [dict(r) for r in conn.execute(
+        "SELECT name,zone,raw_json FROM components WHERE kind='spot'"
+    ).fetchall()]
+    gate_rows = [dict(r) for r in conn.execute(
+        "SELECT name,zone,state,broken,under_maintenance FROM components WHERE kind='gate' ORDER BY name"
+    ).fetchall()]
+    conn.close()
+
+    entries = []
+    exits = []
+    for row in sensor_rows:
+        try:
+            raw = json.loads(row.get("raw_json") or "{}")
+        except Exception:
+            raw = {}
+        purpose = str(raw.get("purpose") or "")
+        if purpose == "EntrySpot":
+            entries.append((row["name"], row.get("zone") or ""))
+        elif purpose == "ExitSpot":
+            exits.append((row["name"], row.get("zone") or ""))
+
+    print("\n====================================================")
+    print(" PARKMIND LEVEL 2 — API-ONLY TOPOLOGY")
+    print("====================================================")
+    print(f" Parking bays : {counts['park']}")
+    print(f" Entry sensors: {counts['entry']} -> {entries}")
+    print(f" Exit sensors : {counts['exit']} -> {exits}")
+    print(f" Barriers     : {counts['gates']}")
+    print(" Barrier roles: NOT EXPOSED BY /list-barriers")
+    print(" Barriers from API:")
+    for g in gate_rows:
+        print(
+            f"   {g['name']}: zone={g.get('zone') or '-'} "
+            f"state={g.get('state') or '?'} "
+            f"broken={bool(g.get('broken'))} "
+            f"maintenance={bool(g.get('under_maintenance'))}"
+        )
+    print("====================================================\n")
 
 
 # ============================================================
@@ -808,7 +1448,6 @@ def component_action(kind, name, action, actor="system", sim_time=None):
         ("gate", "repair"): f"/barrier-gates/{quote(name, safe='')}/repair",
         ("light", "on"): f"/lights/{quote(name, safe='')}/on",
         ("light", "off"): f"/lights/{quote(name, safe='')}/off",
-        ("light", "repair"): f"/lights/{quote(name, safe='')}/repair",
         ("fan", "on"): f"/exhaust-fans/{quote(name, safe='')}/on",
         ("fan", "off"): f"/exhaust-fans/{quote(name, safe='')}/off",
         ("fan", "repair"): f"/exhaust-fans/{quote(name, safe='')}/repair",
@@ -821,8 +1460,11 @@ def component_action(kind, name, action, actor="system", sim_time=None):
     if not row:
         raise ValueError(f"Unknown simulator component: {kind}/{name}")
 
-    if action not in ("repair",) and int(row.get("broken") or 0):
-        raise RuntimeError(f"{name} is broken")
+    if action != "repair":
+        if int(row.get("broken") or 0):
+            raise RuntimeError(f"{name} is broken and cannot be operated")
+        if int(row.get("under_maintenance") or 0):
+            raise RuntimeError(f"{name} is under maintenance and cannot be operated")
 
     try:
         sim_request("POST", path)
@@ -883,9 +1525,180 @@ def is_compatible(raw, car_type):
     return target == car
 
 
-def choose_spot(car_type):
+def cleanup_stale_reservations(sim_time=None):
+    """
+    Level-1 reservation safety restored for Level 2.
+
+    Reservations are software locks, not physical occupancy. If a route failed
+    or the simulator was restarted, an old reservation must not make a truly
+    free simulator bay look unavailable forever.
+    """
+    now_value = sim_time or simulator_now()
+    now_dt = parse_sim_time(now_value)
+
     conn = db()
     rows = [dict(r) for r in conn.execute(
+        """SELECT r.spot,r.plate,r.reserved_at,
+                  c.name AS component_name,c.state,c.broken,c.under_maintenance,c.raw_json
+           FROM reservations r
+           LEFT JOIN components c ON c.name=r.spot AND c.kind='spot'"""
+    ).fetchall()]
+
+    released = []
+    for row in rows:
+        release_reason = None
+
+        # Reservation references a spot that no longer belongs to this loaded level.
+        if not row.get("component_name"):
+            release_reason = "spot no longer exists in current simulator topology"
+        else:
+            try:
+                raw = json.loads(row.get("raw_json") or "{}")
+            except Exception:
+                raw = {}
+
+            if str(raw.get("purpose") or "") != "Park":
+                release_reason = "reserved target is not a parking bay"
+            elif int(row.get("broken") or 0):
+                release_reason = "spot became broken"
+            elif int(row.get("under_maintenance") or 0):
+                release_reason = "spot entered maintenance"
+
+        # Age is based on simulator timestamps, not the laptop clock.
+        if release_reason is None and now_dt:
+            reserved_dt = parse_sim_time(row.get("reserved_at"))
+            if reserved_dt:
+                age = (now_dt - reserved_dt).total_seconds()
+                if age < -5:
+                    # Simulator was reloaded/reset and its clock moved backwards.
+                    release_reason = "reservation belongs to an older simulator session"
+                elif age > RESERVATION_TTL_SECONDS:
+                    release_reason = f"reservation expired after {int(age)} simulator seconds"
+
+        if release_reason:
+            conn.execute("DELETE FROM reservations WHERE spot=?", (row["spot"],))
+            released.append((row["spot"], row["plate"], release_reason))
+
+    conn.commit()
+    conn.close()
+
+    for spot, plate, why in released:
+        audit(
+            "system", "STALE_RESERVATION_RELEASED", plate,
+            f"{spot}: {why}", "OK", now_value
+        )
+
+    if released:
+        print(f"[RESERVATION] Released {len(released)} stale reservation(s).")
+
+    return len(released)
+
+
+def refresh_parking_spots_from_simulator(reason):
+    """
+    One exceptional reconciliation call.
+
+    This is NOT polling. It is used only when PARKMIND thinks a zone has no
+    assignable bay, so we verify the physical simulator state before rejecting
+    the arriving car.
+    """
+    data = sim_request("GET", "/list-parking-spots").json()
+    if not isinstance(data, list):
+        raise RuntimeError("Simulator /list-parking-spots did not return a list")
+
+    current_names = set()
+    for item in data:
+        name = str(item.get("name") or "").strip()
+        if name:
+            current_names.add(name)
+        upsert_component("spot", item, simulator_now())
+
+    # Remove spot rows left over from another loaded level.
+    conn = db()
+    if current_names:
+        placeholders = ",".join("?" for _ in current_names)
+        conn.execute(
+            f"DELETE FROM components WHERE kind='spot' AND name NOT IN ({placeholders})",
+            list(current_names)
+        )
+    conn.commit()
+    conn.close()
+
+    audit(
+        "system", "SPOT_STATE_RESYNC", reason,
+        f"Simulator returned {len(data)} spot/sensor objects",
+        "OK", simulator_now()
+    )
+
+
+def _spot_selection_snapshot(preferred_zone, car_type):
+    """Diagnostic only: explains why a car did or did not get a bay."""
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM components WHERE kind='spot'"
+    ).fetchall()]
+    reservations = {
+        r["spot"] for r in conn.execute("SELECT spot FROM reservations").fetchall()
+    }
+    conn.close()
+
+    stats = {
+        "park_total": 0,
+        "zone_total": 0,
+        "zone_free": 0,
+        "zone_reserved": 0,
+        "zone_broken": 0,
+        "zone_maintenance": 0,
+        "zone_compatible_free": 0,
+    }
+
+    for row in rows:
+        try:
+            raw = json.loads(row.get("raw_json") or "{}")
+        except Exception:
+            raw = {}
+
+        if str(raw.get("purpose") or "") != "Park":
+            continue
+        stats["park_total"] += 1
+
+        if preferred_zone and row.get("zone") != preferred_zone:
+            continue
+
+        stats["zone_total"] += 1
+        if int(row.get("broken") or 0):
+            stats["zone_broken"] += 1
+        if int(row.get("under_maintenance") or 0):
+            stats["zone_maintenance"] += 1
+        if row["name"] in reservations:
+            stats["zone_reserved"] += 1
+        if row.get("state") == "Free":
+            stats["zone_free"] += 1
+            if (
+                not int(row.get("broken") or 0)
+                and not int(row.get("under_maintenance") or 0)
+                and row["name"] not in reservations
+                and is_compatible(raw, car_type)
+            ):
+                stats["zone_compatible_free"] += 1
+
+    return stats
+
+
+def choose_spot(car_type, preferred_zone=None, allow_resync=True):
+    """
+    Dynamic anti-pile selection:
+      1) collect real free/healthy/compatible Park bays
+      2) group them by API zoneParent
+      3) choose the least-loaded compatible zone FIRST
+      4) then choose the best bay inside that zone
+
+    Occupied + reserved/in-flight bays count toward zone pressure.
+    """
+    cleanup_stale_reservations()
+
+    conn = db()
+    free_rows = [dict(r) for r in conn.execute(
         """SELECT c.*
            FROM components c
            WHERE c.kind='spot'
@@ -897,42 +1710,158 @@ def choose_spot(car_type):
              )"""
     ).fetchall()]
 
-    zone_counts = {}
     all_spots = [dict(r) for r in conn.execute(
-        "SELECT zone,state FROM components WHERE kind='spot'"
+        "SELECT * FROM components WHERE kind='spot'"
     ).fetchall()]
+
+    reserved_names = {
+        r["spot"]
+        for r in conn.execute("SELECT spot FROM reservations").fetchall()
+    }
     conn.close()
 
-    for r in all_spots:
-        z = r["zone"] or ""
-        item = zone_counts.setdefault(z, {"total": 0, "busy": 0})
-        item["total"] += 1
-        if r["state"] == "Occupied":
-            item["busy"] += 1
-
-    candidates = []
-    for row in rows:
+    zone_counts = {}
+    for row in all_spots:
         try:
-            raw = json.loads(row["raw_json"] or "{}")
+            raw = json.loads(row.get("raw_json") or "{}")
         except Exception:
             raw = {}
 
         if str(raw.get("purpose") or "") != "Park":
             continue
+
+        zone = str(row.get("zone") or "").strip()
+        if not zone:
+            continue
+
+        z = zone_counts.setdefault(zone, {"total": 0, "busy": 0})
+        z["total"] += 1
+
+        if str(row.get("state") or "") == "Occupied":
+            z["busy"] += 1
+        elif row["name"] in reserved_names:
+            z["busy"] += 1
+
+    candidates_by_zone = defaultdict(list)
+
+    for row in free_rows:
+        try:
+            raw = json.loads(row.get("raw_json") or "{}")
+        except Exception:
+            raw = {}
+
+        if str(raw.get("purpose") or "") != "Park":
+            continue
+
+        zone = str(row.get("zone") or "").strip()
+        if not zone:
+            continue
+        if preferred_zone and zone != preferred_zone:
+            continue
         if not is_compatible(raw, car_type):
             continue
 
-        zone = row["zone"] or ""
-        z = zone_counts.get(zone, {"total": 1, "busy": 0})
-        load = z["busy"] / max(1, z["total"])
-        wear = int(row["cycles"] or 0) / max(1, MAINT_CYCLES["spot"])
-        score = (1 - load) * 0.65 + max(0, 1 - wear) * 0.35
-        candidates.append((score, row["name"], zone))
+        candidates_by_zone[zone].append((row, raw))
 
-    if not candidates:
+    if not candidates_by_zone:
+        stats = _spot_selection_snapshot(preferred_zone, car_type)
+        print(
+            f"[SPOT SELECT] No compatible candidate for "
+            f"car_type={car_type} preferred_zone={preferred_zone}. stats={stats}"
+        )
+
+        if allow_resync:
+            try:
+                refresh_parking_spots_from_simulator(
+                    f"no-candidate:{car_type}:{preferred_zone}"
+                )
+                cleanup_stale_reservations()
+                return choose_spot(
+                    car_type,
+                    preferred_zone=preferred_zone,
+                    allow_resync=False
+                )
+            except Exception as e:
+                audit(
+                    "system", "SPOT_STATE_RESYNC_FAILED",
+                    preferred_zone or "", str(e), "ERROR", simulator_now()
+                )
+
         return None, None
-    candidates.sort(reverse=True)
-    return candidates[0][1], candidates[0][2]
+
+    # Choose the least-loaded compatible zone.
+    zone_rank = []
+    for zone, zone_candidates in candidates_by_zone.items():
+        counts = zone_counts.get(
+            zone, {"total": len(zone_candidates), "busy": 0}
+        )
+        total = max(1, int(counts["total"]))
+        busy = int(counts["busy"])
+        load = busy / total
+
+        zone_rank.append(
+            (load, busy, -len(zone_candidates), zone)
+        )
+
+    zone_rank.sort()
+    chosen_zone = zone_rank[0][3]
+    chosen_load = zone_rank[0][0]
+
+    # Choose the best compatible bay only inside the selected zone.
+    zone_candidates = candidates_by_zone[chosen_zone]
+    max_cycles = max(
+        [int(row.get("cycles") or 0) for row, _ in zone_candidates] + [1]
+    )
+
+    ranked = []
+    for row, raw in zone_candidates:
+        cycles = int(row.get("cycles") or 0)
+        condition = 1.0 - (cycles / max_cycles)
+
+        target = str(raw.get("parkingForCarType") or "Any").lower()
+        car = str(car_type or "Normal").lower()
+
+        type_rank = 1
+        if "electric" in car and target == "electric":
+            type_rank = 0
+        elif "accessible" in car and target == "accessible":
+            type_rank = 0
+        elif target not in ("", "any"):
+            type_rank = 2
+
+        ranked.append(
+            (
+                type_rank,
+                -condition,
+                cycles,
+                _number_suffix(row["name"]),
+                row["name"]
+            )
+        )
+
+    ranked.sort()
+    selected_spot = ranked[0][4]
+
+    load_text = ", ".join(
+        f"{zone}={zone_counts.get(zone, {}).get('busy', 0)}/"
+        f"{zone_counts.get(zone, {}).get('total', 0)}"
+        for zone in sorted(candidates_by_zone)
+    )
+
+    print(
+        f"[ZONE BALANCE] car={car_type} -> zone={chosen_zone}; "
+        f"assigned={selected_spot}; loads=[{load_text}]"
+    )
+    audit(
+        "system", "ZONE_BALANCED_ASSIGNMENT", selected_spot,
+        (
+            f"car_type={car_type}; chosen_zone={chosen_zone}; "
+            f"zone_load={chosen_load:.3f}; loads=[{load_text}]"
+        ),
+        "OK", simulator_now()
+    )
+
+    return selected_spot, chosen_zone
 
 
 def reserve_spot(spot, plate, sim_time):
@@ -956,88 +1885,870 @@ def release_reservation(spot=None, plate=None):
 
 
 # ============================================================
-# MULTI-ENTRY CONTROL
+# MULTI-ENTRY CONTROL — LEVEL 1 FLOW, LEVEL 2 TOPOLOGY
 # ============================================================
+def _entry_item_candidates(entry_spot):
+    return [gate for _, gate, _ in candidate_gates_for_sensor(entry_spot, "entry")]
+
+
+def _requeue_entry_on_next_candidate(item, failed_gate, reason):
+    candidates = list(item.get("gate_candidates") or [])
+    tried = set(item.get("tried_gates") or [])
+    tried.add(failed_gate)
+
+    next_gate = next((g for g in candidates if g not in tried), None)
+    if not next_gate:
+        # The car never entered, so its software bay reservation must be released.
+        release_reservation(plate=item["plate"])
+        upsert_car(
+            item["plate"],
+            assigned_spot=None,
+            status="ENTRY_HOLD",
+            decision=f"No confirmed entrance barrier after trying {sorted(tried)}"
+        )
+        upsert_alert(
+            f"ENTRY_DISCOVERY:{item['plate']}",
+            "CRITICAL", "ENTRY LANE DISCOVERY FAILED",
+            f"Could not confirm a working barrier for {item.get('entry_spot')}. "
+            f"Tried {sorted(tried)}. Last reason: {reason}",
+            simulator_now(),
+            item["plate"],
+            item.get("entry_zone") or ""
+        )
+        return
+
+    item["tried_gates"] = list(tried)
+    item["gate"] = next_gate
+    # A new physical gate trial must be allowed to re-send the route command.
+    item["sent"] = False
+    item["route_sent_at"] = None
+    audit(
+        "system", "ENTRY_GATE_DISCOVERY_RETRY", item["plate"],
+        f"{failed_gate} -> {next_gate}; reason={reason}",
+        "RETRY", simulator_now()
+    )
+    with state_lock:
+        entry_queues[next_gate].insert(0, item)
+    process_entry_gate(next_gate)
+
+
+def delayed_entry_route_release(gate, plate, spot):
+    """
+    Hold the car until the full API-derived route is ready.
+
+    Required before goto/<spot>:
+      - no global gate lockdown
+      - selected entry barrier == Open
+      - every healthy barrier attached to target bay's zoneParent == Open
+    """
+    target_zone = target_zone_for_spot(spot)
+    prepare_zone_access_for_car(plate, spot)
+
+    while True:
+        time.sleep(0.25)
+
+        with state_lock:
+            item = entry_active.get(gate)
+            if not item or item.get("plate") != plate or item.get("sent"):
+                return
+
+        if not gate_traffic_allowed(refresh_live=True):
+            release_reservation(plate=plate)
+            release_zone_access_for_car(plate, target_zone)
+            with state_lock:
+                entry_active.pop(gate, None)
+            upsert_car(
+                plate,
+                assigned_spot=None,
+                status="GATE_LOCKDOWN_ENTRY",
+                decision="Global barrier lockdown before entry release"
+            )
+            return
+
+        if not gate_physically_open(gate):
+            try:
+                component_action(
+                    "gate", gate, "open", "system", simulator_now()
+                )
+            except Exception:
+                pass
+            continue
+
+        if not zone_access_is_open(target_zone):
+            prepare_zone_access_for_car(plate, spot)
+            continue
+
+        try:
+            send_car(plate, spot)
+            with state_lock:
+                current = entry_active.get(gate)
+                if current and current.get("plate") == plate:
+                    current["sent"] = True
+                    current["route_sent_at"] = time.time()
+
+            upsert_car(plate, status="TO_SPOT")
+            audit(
+                "system", "ENTRY_ROUTE_RELEASED", plate,
+                (
+                    f"entry_gate={gate}; target_zone={target_zone}; "
+                    f"destination={spot}; full route confirmed open"
+                ),
+                "OK", simulator_now()
+            )
+        except Exception as e:
+            audit(
+                "system", "ENTRY_ROUTE_RELEASE_FAILED", plate,
+                str(e), "ERROR", simulator_now()
+            )
+        return
+
+
+def entry_lane_discovery_watch(gate, plate):
+    """
+    Entry gate lifecycle:
+
+      request Open
+        -> wait for API state == Open
+        -> send car to assigned bay
+        -> KEEP THIS GATE OPEN
+        -> wait as long as necessary for EntrySpot CarOut
+        -> only CarOut is allowed to release/restore the gate
+
+    A slow car is never punished by closing the door underneath it.
+    Gate discovery fallback is used only when the car was NEVER released.
+    """
+    started = time.time()
+
+    while True:
+        time.sleep(0.5)
+
+        with state_lock:
+            current = entry_active.get(gate)
+            if not current or current.get("plate") != plate:
+                # Real EntrySpot CarOut removed it. Crossing is complete.
+                return
+            sent = bool(current.get("sent"))
+
+        if sent:
+            # The car has been authorized to cross. Keep the physical gate open
+            # until EntrySpot CarOut removes entry_active[gate].
+            row = component_row(gate, "gate") or {}
+            if int(row.get("broken") or 0) or int(row.get("under_maintenance") or 0):
+                upsert_alert(
+                    f"ENTRY_GATE_FAILED_DURING_CROSSING:{plate}",
+                    "CRITICAL",
+                    "ENTRY GATE FAILED DURING CROSSING",
+                    f"{gate} became unavailable while {plate} was crossing.",
+                    simulator_now(),
+                    plate,
+                    component=gate
+                )
+                continue
+
+            live_state = refresh_live_gate_state(gate).strip().lower()
+            if live_state not in ("open", "opening"):
+                try:
+                    component_action("gate", gate, "open", "system", simulator_now())
+                    audit(
+                        "system",
+                        "ENTRY_GATE_HOLD_OPEN",
+                        plate,
+                        f"Re-opened {gate}; waiting for real EntrySpot CarOut.",
+                        "OK",
+                        simulator_now()
+                    )
+                except Exception as e:
+                    audit(
+                        "system",
+                        "ENTRY_GATE_HOLD_OPEN",
+                        plate,
+                        str(e),
+                        "ERROR",
+                        simulator_now()
+                    )
+            continue
+
+        # If the entry gate is already Open, any remaining delay is target-zone
+        # access. Do not switch to another entrance barrier and create a pile.
+        if gate_physically_open(gate):
+            continue
+
+        # The candidate entry gate itself never became usable.
+        if time.time() - started < LANE_DISCOVERY_TIMEOUT_SEC:
+            continue
+
+        with state_lock:
+            current = entry_active.get(gate)
+            if not current or current.get("plate") != plate:
+                return
+            if current.get("sent"):
+                continue
+            item = dict(current)
+            entry_active.pop(gate, None)
+
+        try:
+            auto_restore_gate_api_baseline(gate, "system", simulator_now())
+        except Exception:
+            pass
+
+        _requeue_entry_on_next_candidate(
+            item,
+            gate,
+            f"{gate} never produced a confirmed Open release within "
+            f"{LANE_DISCOVERY_TIMEOUT_SEC:.1f}s"
+        )
+        return
+
+
+def refresh_all_gate_health_from_api():
+    """
+    Refresh ALL barrier health from the real /list-barriers endpoint.
+
+    No gate names or roles are assumed. Every barrier returned by the API
+    participates in the global safety interlock.
+    """
+    try:
+        items = sim_request("GET", "/list-barriers").json()
+        if not isinstance(items, list):
+            return False
+
+        now_value = simulator_now()
+        for item in items:
+            upsert_component("gate", item, now_value)
+        return True
+    except Exception as e:
+        audit(
+            "system",
+            "GATE_HEALTH_REFRESH_FAILED",
+            "",
+            str(e),
+            "USING_LAST_KNOWN_STATE",
+            simulator_now()
+        )
+        return False
+
+
+def gate_lockdown_status(refresh_live=False):
+    """
+    Return (locked, problem_gates).
+
+    GLOBAL rule requested for Level 2:
+      if ANY simulator barrier is broken OR under maintenance,
+      PARKMIND admits nobody and releases nobody.
+
+    This is completely dynamic: every gate comes from /list-barriers.
+    """
+    if refresh_live:
+        refresh_all_gate_health_from_api()
+
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        """SELECT name,zone,state,broken,under_maintenance
+           FROM components
+           WHERE kind='gate'
+             AND (broken=1 OR under_maintenance=1)
+           ORDER BY name"""
+    ).fetchall()]
+    conn.close()
+
+    return bool(rows), rows
+
+
+def gate_lockdown_reason(problem_gates):
+    parts = []
+    for row in problem_gates:
+        flags = []
+        if int(row.get("broken") or 0):
+            flags.append("BROKEN")
+        if int(row.get("under_maintenance") or 0):
+            flags.append("UNDER_MAINTENANCE")
+        parts.append(
+            f"{row.get('name')}[{'+'.join(flags) or 'UNAVAILABLE'}]"
+        )
+    return ", ".join(parts)
+
+
+def mark_gate_lockdown(problem_gates, sim_time=None):
+    reason = gate_lockdown_reason(problem_gates)
+    upsert_alert(
+        "GLOBAL_GATE_LOCKDOWN",
+        "CRITICAL",
+        "CAR PARK GATE LOCKDOWN",
+        (
+            f"Entry and exit are blocked because barrier(s) are unavailable: "
+            f"{reason}. Maintenance must repair them and PARKMIND must receive "
+            f"the real component_fixed/API healthy state before traffic resumes."
+        ),
+        sim_time or simulator_now()
+    )
+    set_state("gate_lockdown", "1")
+    audit(
+        "system",
+        "GLOBAL_GATE_LOCKDOWN",
+        "",
+        reason,
+        "ENTRY_AND_EXIT_BLOCKED",
+        sim_time or simulator_now()
+    )
+
+
+def hold_unreleased_gate_traffic(problem_gates, sim_time=None):
+    """
+    Freeze all NOT-YET-RELEASED gate traffic.
+
+    Commands that were already sent to a moving car cannot be recalled from the
+    simulator. We do not issue any NEW entry/exit movement after lockdown.
+    """
+    held_entries = []
+
+    with state_lock:
+        # Cars waiting in per-gate entry queues have not been released yet.
+        for gate, queue in list(entry_queues.items()):
+            while queue:
+                held_entries.append(dict(queue.pop(0)))
+
+        # Active entry item is safe to hold only if no goto command was sent yet.
+        for gate, item in list(entry_active.items()):
+            if not item.get("sent"):
+                held_entries.append(dict(item))
+                entry_active.pop(gate, None)
+
+        # Paid exit releases not yet sent are cancelled and will resume after fix.
+        for gate, item in list(exit_active.items()):
+            if not item.get("sent"):
+                plate = item.get("plate")
+                if plate:
+                    upsert_car(
+                        plate,
+                        status="PAID_GATE_LOCKDOWN",
+                        decision="Global barrier lockdown: waiting for maintenance repair"
+                    )
+                exit_active.pop(gate, None)
+
+        # Remove software release queues; PAID state remains stored in cars table.
+        for gate in list(paid_exit_queues.keys()):
+            paid_exit_queues[gate].clear()
+
+    # Entry holds should not keep parking bays reserved for an indefinite outage.
+    seen = set()
+    for item in held_entries:
+        plate = item.get("plate")
+        if not plate or plate in seen:
+            continue
+        seen.add(plate)
+        release_reservation(plate=plate)
+        upsert_car(
+            plate,
+            assigned_spot=None,
+            status="GATE_LOCKDOWN_ENTRY",
+            decision=(
+                "Global barrier lockdown: no admission until all gates are "
+                "healthy after maintenance"
+            )
+        )
+
+    mark_gate_lockdown(problem_gates, sim_time)
+
+
+def gate_traffic_allowed(refresh_live=False, sim_time=None):
+    locked, problems = gate_lockdown_status(refresh_live=refresh_live)
+    if locked:
+        mark_gate_lockdown(problems, sim_time)
+        return False
+    return True
+
+
+def resume_after_gate_lockdown(sim_time=None):
+    """
+    Resume only when EVERY API/DB barrier is healthy.
+
+    A signed component_fixed event from the repair flow updates the repaired
+    gate. If another gate is still broken/under maintenance, lockdown remains.
+    """
+    locked, problems = gate_lockdown_status(refresh_live=False)
+    if locked:
+        mark_gate_lockdown(problems, sim_time)
+        return False
+
+    set_state("gate_lockdown", "0")
+    resolve_alert("GLOBAL_GATE_LOCKDOWN", sim_time or simulator_now())
+    audit(
+        "system",
+        "GLOBAL_GATE_LOCKDOWN_CLEARED",
+        "",
+        "All API-reported barriers are healthy.",
+        "TRAFFIC_RESUMED",
+        sim_time or simulator_now()
+    )
+
+    # Re-admit cars that were physically waiting at EntrySpot.
+    conn = db()
+    entry_waiters = [dict(r) for r in conn.execute(
+        """SELECT plate,car_type,planned_minutes,entry_spot,entry_time
+           FROM cars
+           WHERE status='GATE_LOCKDOWN_ENTRY'
+             AND departure_time IS NULL
+           ORDER BY entry_time ASC"""
+    ).fetchall()]
+
+    paid_waiters = [dict(r) for r in conn.execute(
+        """SELECT plate
+           FROM cars
+           WHERE payment_status='PAID'
+             AND exit_spot IS NOT NULL
+             AND departure_time IS NULL
+             AND status IN('PAID_GATE_LOCKDOWN','PAID_WAITING_GATE','PAID')
+           ORDER BY exit_arrival_time ASC"""
+    ).fetchall()]
+    conn.close()
+
+    for car in entry_waiters:
+        try:
+            enqueue_arrival(
+                car["plate"],
+                car.get("car_type") or "Normal",
+                int(car.get("planned_minutes") or 0),
+                car.get("entry_spot") or "",
+                car.get("entry_time") or sim_time or simulator_now()
+            )
+        except Exception as e:
+            audit(
+                "system",
+                "ENTRY_RESUME_AFTER_GATE_FIX_FAILED",
+                car["plate"],
+                str(e),
+                "ERROR",
+                sim_time or simulator_now()
+            )
+
+    # Parked vehicles whose planned exit matured during lockdown remain in
+    # exit_request_queue; restart that dispatcher now.
+    dispatch_exit_requests()
+
+    # Already-paid cars physically waiting at ExitSpots may now release.
+    for car in paid_waiters:
+        try:
+            queue_paid_vehicle_for_release(car["plate"])
+        except Exception as e:
+            audit(
+                "system",
+                "PAID_EXIT_RESUME_AFTER_GATE_FIX_FAILED",
+                car["plate"],
+                str(e),
+                "ERROR",
+                sim_time or simulator_now()
+            )
+
+    return True
+
+
+def target_zone_for_spot(spot_name):
+    row = component_row(spot_name, "spot") or {}
+    return str(row.get("zone") or "").strip()
+
+
+def healthy_gates_in_zone(zone_name):
+    """
+    Return healthy barriers whose API zoneParent matches the target bay's
+    API zoneParent. No entry/exit role is invented.
+    """
+    if not zone_name:
+        return []
+
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        """SELECT name,state,broken,under_maintenance
+           FROM components
+           WHERE kind='gate' AND zone=?
+           ORDER BY name""",
+        (zone_name,)
+    ).fetchall()]
+    conn.close()
+
+    return [
+        row for row in rows
+        if not int(row.get("broken") or 0)
+        and not int(row.get("under_maintenance") or 0)
+    ]
+
+
+def prepare_zone_access_for_car(plate, spot_name):
+    """
+    Before routing to a bay, open healthy barriers attached by the API to that
+    bay's target zone. They stay open until a real Park CarIn confirms arrival.
+    """
+    zone_name = target_zone_for_spot(spot_name)
+    if not zone_name:
+        return ""
+
+    with state_lock:
+        zone_access_users[zone_name].add(plate)
+
+    for row in healthy_gates_in_zone(zone_name):
+        gate = row["name"]
+        state = str(row.get("state") or "").strip().lower()
+        if state not in ("open", "opening"):
+            try:
+                component_action("gate", gate, "open", "system", simulator_now())
+                audit(
+                    "system", "ZONE_ACCESS_OPEN_REQUEST", plate,
+                    f"target_zone={zone_name}; barrier={gate}",
+                    "OK", simulator_now()
+                )
+            except Exception as e:
+                audit(
+                    "system", "ZONE_ACCESS_OPEN_REQUEST", plate,
+                    f"target_zone={zone_name}; barrier={gate}; {e}",
+                    "ERROR", simulator_now()
+                )
+
+    return zone_name
+
+
+def zone_access_is_open(zone_name):
+    """
+    A target zone is ready only when every healthy barrier whose API zoneParent
+    matches that zone is confirmed Open by /list-barriers.
+    """
+    if not zone_name:
+        return True
+
+    try:
+        data = sim_request("GET", "/list-barriers").json()
+        if not isinstance(data, list):
+            return False
+
+        matched = []
+        now_value = simulator_now()
+
+        for item in data:
+            upsert_component("gate", item, now_value)
+
+            if str(item.get("zoneParent") or "").strip() != zone_name:
+                continue
+            if bool(item.get("broken", False)):
+                return False
+            if bool(item.get("isUnderMaintenance", False)):
+                return False
+            matched.append(item)
+
+        if not matched:
+            return True
+
+        return all(
+            str(item.get("state") or "").strip().lower() == "open"
+            for item in matched
+        )
+
+    except Exception as e:
+        audit(
+            "system", "ZONE_ACCESS_STATE_READ_FAILED", zone_name,
+            str(e), "NOT_READY", simulator_now()
+        )
+        return False
+
+
+def release_zone_access_for_car(plate, zone_name=None):
+    """
+    Restore target-zone barriers only after a real Park CarIn and only when no
+    other in-flight car still needs that same zone.
+    """
+    if not zone_name:
+        car = get_car(plate) or {}
+        spot = car.get("actual_spot") or car.get("assigned_spot")
+        zone_name = target_zone_for_spot(spot) if spot else ""
+
+    if not zone_name:
+        return
+
+    with state_lock:
+        users = zone_access_users.get(zone_name)
+        if users:
+            users.discard(plate)
+        still_needed = bool(users)
+        if not still_needed:
+            zone_access_users.pop(zone_name, None)
+
+    if still_needed:
+        return
+
+    for row in healthy_gates_in_zone(zone_name):
+        try:
+            auto_restore_gate_api_baseline(
+                row["name"], "system", simulator_now()
+            )
+        except Exception as e:
+            audit(
+                "system", "ZONE_ACCESS_RESTORE_FAILED", row["name"],
+                str(e), "ERROR", simulator_now()
+            )
+
+
+def delayed_restore_entry_gate_if_idle(gate):
+    """
+    Short idle grace avoids close/open flapping when simulator cars arrive
+    back-to-back at the same EntrySpot.
+    """
+    time.sleep(ENTRY_IDLE_RESTORE_GRACE_SEC)
+
+    with state_lock:
+        if gate in entry_active:
+            return
+        if entry_queues.get(gate):
+            return
+
+    try:
+        auto_restore_gate_api_baseline(
+            gate, "system", simulator_now()
+        )
+    except Exception as e:
+        audit(
+            "system", "ENTRY_IDLE_RESTORE_FAILED", gate,
+            str(e), "ERROR", simulator_now()
+        )
+
+
+def refresh_live_gate_state(gate):
+    """
+    Read the CURRENT barrier state directly from /list-barriers.
+
+    This is intentionally used at the moment of vehicle release so PARKMIND
+    never relies on a stale SQLite state or on a guessed timing delay.
+    """
+    try:
+        data = sim_request("GET", "/list-barriers").json()
+        if not isinstance(data, list):
+            return ""
+
+        for item in data:
+            if str(item.get("name") or "") != str(gate):
+                continue
+
+            # Keep our DB snapshot aligned with the API response.
+            upsert_component("gate", item)
+            return str(item.get("state") or "")
+
+    except Exception as e:
+        audit(
+            "system",
+            "GATE_LIVE_STATE_READ_FAILED",
+            gate,
+            str(e),
+            "NO_RELEASE",
+            simulator_now()
+        )
+
+    return ""
+
+
+def gate_physically_open(gate):
+    """
+    Release interlock: only literal API/webhook state 'Open' is accepted.
+    'Opening', 'Closed', 'Closing', unknown or API failure are NOT enough.
+    """
+    live_state = refresh_live_gate_state(gate)
+    return live_state.strip().lower() == "open"
+
+
 def process_entry_gate(gate):
     with state_lock:
         if gate in entry_active or not entry_queues[gate]:
             return
         item = entry_queues[gate].pop(0)
-        entry_active[gate] = {
-            "plate": item["plate"],
-            "spot": item["spot"],
-            "sent": False
-        }
+        item["gate"] = gate
+        item.setdefault("tried_gates", [])
+        entry_active[gate] = item
+
+    plate = item["plate"]
+    spot = item["spot"]
+
+    # Dynamic target-zone access: Park bay zoneParent -> barrier zoneParent.
+    target_zone = prepare_zone_access_for_car(plate, spot)
+
+    # Fail closed if any barrier anywhere in the car park is unavailable.
+    locked, gate_problems = gate_lockdown_status(refresh_live=True)
+    if locked:
+        with state_lock:
+            entry_active.pop(gate, None)
+        release_reservation(plate=plate)
+        release_zone_access_for_car(plate, target_zone)
+        upsert_car(
+            plate,
+            assigned_spot=None,
+            status="GATE_LOCKDOWN_ENTRY",
+            decision="Global barrier lockdown before entry release"
+        )
+        hold_unreleased_gate_traffic(gate_problems, simulator_now())
+        return
 
     try:
         gate_row = component_row(gate, "gate") or {}
-        if str(gate_row.get("state") or "").lower() in ("open", "opening"):
-            send_car(item["plate"], item["spot"])
+        if int(gate_row.get("broken") or 0) or int(gate_row.get("under_maintenance") or 0):
+            raise RuntimeError(f"{gate} is broken or under maintenance")
+
+        # Release only when the entry gate AND target-zone barriers are open.
+        if gate_physically_open(gate) and zone_access_is_open(target_zone):
+            send_car(plate, spot)
             with state_lock:
-                if gate in entry_active:
+                if gate in entry_active and entry_active[gate].get("plate") == plate:
                     entry_active[gate]["sent"] = True
-            upsert_car(item["plate"], status="TO_SPOT")
+                    entry_active[gate]["route_sent_at"] = time.time()
+            upsert_car(plate, status="TO_SPOT")
         else:
             component_action("gate", gate, "open", "system", simulator_now())
+
+        threading.Thread(
+            target=delayed_entry_route_release,
+            args=(gate, plate, spot),
+            daemon=True
+        ).start()
+        threading.Thread(
+            target=entry_lane_discovery_watch,
+            args=(gate, plate),
+            daemon=True
+        ).start()
+
     except Exception as e:
         with state_lock:
             entry_active.pop(gate, None)
-            entry_queues[gate].insert(0, item)
-        upsert_alert(
-            f"ENTRY_GATE:{gate}",
-            "CRITICAL", "ENTRY GATE UNAVAILABLE",
-            f"Could not open {gate}: {e}",
-            simulator_now(), item["plate"], component=gate
-        )
+        _requeue_entry_on_next_candidate(item, gate, str(e))
 
 
 def enqueue_arrival(plate, car_type, planned, entry_spot, sim_time):
-    zone = sensor_zone(entry_spot)
-    spot, spot_zone = choose_spot(car_type)
-    if not spot:
-        upsert_car(plate, status="NO_SAFE_SPACE", decision="No compatible safe spot")
+    # If PARKMIND started before the user clicked "Load Level 2", the first
+    # signed entry event performs the one required topology sync.
+    if not ensure_level2_topology_ready(f"entry:{entry_spot}"):
         upsert_alert(
-            f"NO_SPACE:{plate}", "HIGH", "NO SAFE PARKING SPACE",
-            "No compatible free healthy spot is available.",
-            sim_time, plate, zone
+            f"TOPOLOGY_NOT_READY:{entry_spot}",
+            "CRITICAL", "LEVEL 2 TOPOLOGY NOT READY",
+            "The simulator has not exposed the required Level 2 component topology yet.",
+            sim_time, plate
         )
-        try:
-            send_car(plate, "leavepark")
-        except Exception:
-            pass
         return
 
-    gate = gate_for_sensor(entry_spot, "entry")
-    if not gate:
-        reserve_spot(spot, plate, sim_time)
+    entry_api_zone = sensor_zone(entry_spot)
+
+    # GLOBAL BARRIER INTERLOCK:
+    # if ANY gate is broken/under maintenance, this car remains at EntrySpot.
+    locked, gate_problems = gate_lockdown_status(refresh_live=True)
+    if locked:
         upsert_car(
-            plate, assigned_spot=spot, status="ENTRY_HOLD",
-            decision="Entry gate topology unresolved"
+            plate,
+            car_type=car_type,
+            planned_minutes=planned,
+            entry_time=sim_time,
+            entry_spot=entry_spot,
+            entry_zone=entry_api_zone,
+            assigned_spot=None,
+            status="GATE_LOCKDOWN_ENTRY",
+            decision=(
+                "Admission blocked until all simulator barriers are healthy: "
+                + gate_lockdown_reason(gate_problems)
+            )
         )
-        upsert_alert(
-            f"ENTRY_MAP:{entry_spot}", "CRITICAL", "ENTRY GATE MAPPING REQUIRED",
-            f"PARKMIND cannot safely identify the barrier serving {entry_spot}.",
-            sim_time, plate, zone
-        )
+        hold_unreleased_gate_traffic(gate_problems, sim_time)
         return
 
-    reserve_spot(spot, plate, sim_time)
+    # Record the trustworthy simulator entry immediately, even if lane discovery
+    # later needs to try more than one barrier.
     upsert_car(
         plate,
         car_type=car_type,
         planned_minutes=planned,
         entry_time=sim_time,
         entry_spot=entry_spot,
-        entry_zone=zone,
+        entry_zone=entry_api_zone,
+        status="WAITING_ENTRY"
+    )
+
+    # EntrySpot.zoneParent is not exposed by the Level 2 API.
+    # Therefore choose across ALL real Park bays and let API zoneParent +
+    # current occupancy/reservations balance cars across ZONE1/2/3.
+    spot, spot_zone = choose_spot(car_type, preferred_zone=None)
+    if not spot:
+        stats = _spot_selection_snapshot(None, car_type)
+        reason = (
+            f"After a live simulator resync, no compatible free healthy bay "
+            f"is available anywhere in the API-reported parking zones. stats={stats}"
+        )
+        upsert_car(
+            plate,
+            status="NO_SAFE_SPACE",
+            decision=reason
+        )
+        upsert_alert(
+            f"NO_SPACE:{plate}", "HIGH", "NO SAFE PARKING SPACE",
+            reason,
+            sim_time, plate, entry_api_zone
+        )
+
+        # This is now an intentional rejection only after the physical API was
+        # re-checked. It should never happen while the simulator still has a
+        # compatible free bay in this zone.
+        print(f"[ENTRY REJECT] {plate}: {reason}")
+        try:
+            send_car(plate, "leavepark")
+        except Exception as e:
+            audit(
+                "system", "ENTRY_REJECT_LEAVEPARK_FAILED",
+                plate, str(e), "ERROR", sim_time
+            )
+        return
+
+    # The assigned parking bay's zoneParent is real API data.
+    upsert_car(
+        plate,
+        entry_zone=spot_zone,
+        decision=f"Assigned {spot} in API zone {spot_zone}"
+    )
+
+    candidates = _entry_item_candidates(entry_spot)
+    if not candidates:
+        upsert_car(
+            plate, assigned_spot=None, status="ENTRY_HOLD",
+            decision="No healthy entrance barrier candidate"
+        )
+        upsert_alert(
+            f"ENTRY_MAP:{entry_spot}", "CRITICAL", "ENTRY GATE MAPPING REQUIRED",
+            f"No healthy simulator barrier can be associated with {entry_spot}.",
+            sim_time, plate, entry_api_zone
+        )
+        return
+
+    gate = candidates[0]
+    reserve_spot(spot, plate, sim_time)
+    upsert_car(
+        plate,
         assigned_spot=spot,
         status="WAITING_ENTRY",
-        decision=f"Assigned {spot} in {spot_zone}"
+        decision=f"Assigned {spot} in {spot_zone}; entry candidate {gate}"
+    )
+
+    item = {
+        "plate": plate,
+        "spot": spot,
+        "entry_spot": entry_spot,
+        "entry_zone": spot_zone,
+        "gate_candidates": candidates,
+        "tried_gates": [],
+        "sent": False,
+        "route_sent_at": None,
+    }
+
+    audit(
+        "system", "ENTRY_ASSIGN", plate,
+        f"{entry_spot} -> gate candidates={candidates}; assigned={spot}",
+        "OK", sim_time
     )
 
     with state_lock:
-        entry_queues[gate].append({"plate": plate, "spot": spot})
+        entry_queues[gate].append(item)
     process_entry_gate(gate)
 
+
+
+# ============================================================
+# EXIT + PAYMENT: NO PAYMENT = NO GATE
 
 # ============================================================
 # EXIT + PAYMENT: NO PAYMENT = NO GATE
@@ -1076,7 +2787,34 @@ def schedule_exit(plate, planned_minutes):
     t.start()
 
 
+def api_exit_sensors_for_zone(zone_name):
+    """Return healthy ExitSpot sensors whose zoneParent is exposed by the API."""
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        """SELECT * FROM components
+           WHERE kind='spot' AND zone=?
+             AND broken=0 AND under_maintenance=0""",
+        (zone_name,)
+    ).fetchall()]
+    conn.close()
+
+    result = []
+    for row in rows:
+        try:
+            raw = json.loads(row.get("raw_json") or "{}")
+        except Exception:
+            raw = {}
+        if str(raw.get("purpose") or "") == "ExitSpot":
+            result.append(row["name"])
+    return sorted(result)
+
+
 def dispatch_exit_requests():
+    # Cars remain parked while ANY barrier is broken or under maintenance.
+    # Keep exit_request_queue intact; resume_after_gate_lockdown() restarts it.
+    if not gate_traffic_allowed(refresh_live=True):
+        return
+
     capacity = exit_capacity()
     conn = db()
     active = conn.execute(
@@ -1096,9 +2834,47 @@ def dispatch_exit_requests():
         car = get_car(plate)
         if not car or car.get("status") != "PARKED":
             continue
+
+        actual_spot = car.get("actual_spot") or car.get("assigned_spot")
+        spot_row = component_row(actual_spot, "spot") if actual_spot else None
+        zone = (
+            (spot_row or {}).get("zone")
+            or car.get("entry_zone")
+            or ""
+        )
+        exit_candidates = api_exit_sensors_for_zone(zone)
+        target_exit = exit_candidates[0] if exit_candidates else None
+
+        if not target_exit:
+            upsert_alert(
+                f"EXIT_ROUTE:{plate}",
+                "HIGH", "EXIT ROUTE FAILURE",
+                f"The simulator API exposes no healthy ExitSpot for parking zone {zone!r}.",
+                simulator_now(), plate, zone
+            )
+            continue
+
+        exit_row = component_row(target_exit, "spot")
+        if exit_row and (
+            int(exit_row.get("broken") or 0)
+            or int(exit_row.get("under_maintenance") or 0)
+        ):
+            upsert_alert(
+                f"EXIT_ROUTE:{plate}",
+                "CRITICAL", "EXIT SENSOR UNAVAILABLE",
+                f"{target_exit} is broken or under maintenance.",
+                simulator_now(), plate, zone, target_exit
+            )
+            continue
+
         try:
-            send_car(plate, "exit")
-            upsert_car(plate, status="TO_EXIT")
+            send_car(plate, target_exit)
+            upsert_car(
+                plate,
+                status="TO_EXIT",
+                exit_spot=target_exit,
+                exit_zone=zone
+            )
             active += 1
         except Exception as e:
             upsert_alert(
@@ -1109,106 +2885,669 @@ def dispatch_exit_requests():
 
 
 def calculate_charge(plate, exit_sim_time):
-    car = get_car(plate)
-    if not car or not car.get("parked_time"):
-        return 0, 0, 0, 0
+    """
+    Authoritative Level 2 billing.
 
-    seconds = sim_seconds_between(car["parked_time"], exit_sim_time)
-    minutes = max(1, math.ceil(seconds / 60))
-    parking = round(minutes * PARKING_RATE_PER_MIN, 2)
-    charging = 0.0
-    if "electric" in str(car.get("car_type") or "").lower():
-        charging = round(minutes * EV_CHARGING_RATE_PER_MIN, 2)
-    return seconds, minutes, parking, charging
+    TIME:
+      billable parking duration = physical Park/CarIn timestamp
+                                  -> physical ExitSpot/CarIn timestamp
+
+    MONEY:
+      Normal/Accessible total = minutes * PARKING_RATE_PER_MIN
+      Electric total          = Normal price * 2
+
+    The /car/{plate}/charge API accepts parkingCost and chargingCost
+    separately, so for Electric cars the second half of the 2x total is
+    sent as chargingCost. There is no invented extra multiplier on top.
+    """
+    car = get_car(plate)
+    if not car:
+        return 0, 1, float(PARKING_RATE_PER_MIN), 0.0
+
+    parked_time = car.get("parked_time")
+    seconds = sim_seconds_between(parked_time, exit_sim_time)
+
+    # A physical trip that reaches ExitSpot in <60s is still billed as 1 min.
+    # If a timestamp is missing, use planned_minutes only as a defensive
+    # fallback; normal operation always uses simulator timestamps.
+    if parked_time and exit_sim_time:
+        minutes = max(1, math.ceil(seconds / 60))
+    else:
+        minutes = max(1, int(car.get("planned_minutes") or 1))
+
+    base_parking = round(minutes * PARKING_RATE_PER_MIN, 2)
+    is_electric = "electric" in str(car.get("car_type") or "").lower()
+
+    if is_electric:
+        total = round(base_parking * ELECTRIC_TOTAL_MULTIPLIER, 2)
+        charging = round(total - base_parking, 2)
+    else:
+        charging = 0.0
+
+    return seconds, minutes, base_parking, charging
 
 
 def gate_has_unpaid_blocker(gate):
-    conn = db()
-    row = conn.execute(
-        """SELECT plate FROM cars
-           WHERE exit_gate=?
-             AND exit_arrival_time IS NOT NULL
-             AND departure_time IS NULL
-             AND payment_status!='PAID'
-             AND status IN('AT_EXIT','PAYMENT_PENDING','PAYMENT_HOLD','UNREGISTERED_EXIT')
-           LIMIT 1""",
-        (gate,)
-    ).fetchone()
-    conn.close()
-    return row["plate"] if row else None
+    """
+    Return an unpaid vehicle only when it is physically FIRST at an ExitSpot
+    associated with this gate. Cars queued behind the front vehicle do not
+    incorrectly block a paid front vehicle.
+    """
+    with state_lock:
+        fronts = [
+            queue[0]
+            for queue in physical_exit_queues.values()
+            if queue
+        ]
+
+    for plate in fronts:
+        car = get_car(plate) or {}
+        if car.get("exit_gate") != gate:
+            continue
+        if car.get("payment_status") != "PAID":
+            return plate
+
+    return None
+
+
+
+
+def _exit_candidates_for_plate(plate):
+    car = get_car(plate) or {}
+    sensor = car.get("exit_spot")
+    if not sensor:
+        return []
+    return [gate for _, gate, _ in candidate_gates_for_sensor(sensor, "exit")]
+
+
+def _queue_paid_exit_on_next_gate(plate, failed_gate, reason):
+    car = get_car(plate) or {}
+    candidates = _exit_candidates_for_plate(plate)
+    tried = set()
+
+    with lane_trial_lock:
+        raw = get_state(f"exit_tried:{plate}", "")
+        if raw:
+            tried.update(x for x in raw.split(",") if x)
+        tried.add(failed_gate)
+        set_state(f"exit_tried:{plate}", ",".join(sorted(tried)))
+
+    next_gate = next((g for g in candidates if g not in tried), None)
+    if not next_gate:
+        upsert_car(plate, status="PAID_EXIT_HOLD")
+        upsert_alert(
+            f"EXIT_DISCOVERY:{plate}",
+            "CRITICAL", "EXIT LANE DISCOVERY FAILED",
+            f"Payment is valid, but no exit barrier produced a physical departure. "
+            f"Tried {sorted(tried)}. Last reason: {reason}. Vehicle remains held.",
+            simulator_now(), plate,
+            car.get("exit_zone") or ""
+        )
+        return
+
+    upsert_car(plate, exit_gate=next_gate, status="PAID_WAITING_GATE")
+    audit(
+        "system", "EXIT_GATE_DISCOVERY_RETRY", plate,
+        f"{failed_gate} -> {next_gate}; reason={reason}",
+        "RETRY", simulator_now()
+    )
+    with state_lock:
+        paid_exit_queues[next_gate].insert(0, plate)
+    process_paid_exit_gate(next_gate)
+
+
+def delayed_paid_exit_release(gate, plate):
+    """
+    Safety fallback for a late/missed exit-gate webhook.
+
+    Payment alone is NOT enough. The selected barrier must also be confirmed
+    fully Open by the simulator API before goto/leavepark is sent.
+    """
+    time.sleep(ROUTE_RELEASE_FALLBACK_SEC)
+
+    with state_lock:
+        item = exit_active.get(gate)
+        if not item or item.get("plate") != plate or item.get("sent"):
+            return
+
+    car = get_car(plate) or {}
+    if car.get("payment_status") != "PAID":
+        return
+
+    if not gate_traffic_allowed(refresh_live=True):
+        with state_lock:
+            exit_active.pop(gate, None)
+        upsert_car(
+            plate,
+            status="PAID_GATE_LOCKDOWN",
+            decision="Global barrier lockdown before delayed exit release"
+        )
+        return
+
+    if not gate_physically_open(gate):
+        audit(
+            "system",
+            "PAID_EXIT_RELEASE_BLOCKED_GATE_NOT_OPEN",
+            plate,
+            f"{gate} is not confirmed Open; paid car remains held.",
+            "BLOCKED",
+            simulator_now()
+        )
+        return
+
+    try:
+        latest = get_car(plate) or {}
+        if latest.get("payment_status") != "PAID":
+            audit(
+                "system",
+                "EXIT_RELEASE_BLOCKED_UNPAID",
+                plate,
+                "leavepark command blocked because payment_status is not PAID.",
+                "BLOCKED",
+                simulator_now()
+            )
+            return
+
+        send_car(plate, "leavepark")
+        with state_lock:
+            current = exit_active.get(gate)
+            if current and current.get("plate") == plate:
+                current["sent"] = True
+
+        audit(
+            "system",
+            "PAID_EXIT_RELEASE_API_CONFIRMED",
+            plate,
+            f"{gate}=Open confirmed by simulator API; leavepark sent.",
+            "OK",
+            simulator_now()
+        )
+    except Exception as e:
+        audit(
+            "system",
+            "PAID_EXIT_RELEASE_API_CONFIRMED",
+            plate,
+            str(e),
+            "ERROR",
+            simulator_now()
+        )
+
+
+def exit_lane_discovery_watch(gate, plate):
+    """
+    Exit gate lifecycle:
+
+      payment must be PAID
+        -> request Open
+        -> wait for API state == Open
+        -> send leavepark
+        -> KEEP THIS GATE OPEN
+        -> wait as long as necessary for real ExitSpot CarOut
+        -> only CarOut may restore/close the gate
+
+    An unpaid vehicle never reaches this release lifecycle.
+    """
+    started = time.time()
+
+    while True:
+        time.sleep(0.5)
+
+        car = get_car(plate) or {}
+
+        # Hard payment interlock remains true throughout the entire crossing.
+        if car.get("payment_status") != "PAID":
+            with state_lock:
+                current = exit_active.get(gate)
+                if current and current.get("plate") == plate:
+                    exit_active.pop(gate, None)
+
+            try:
+                auto_restore_gate_api_baseline(gate, "system", simulator_now())
+            except Exception:
+                pass
+
+            upsert_alert(
+                f"EXIT_PAYMENT_INTERLOCK:{plate}",
+                "CRITICAL",
+                "EXIT RELEASE CANCELLED",
+                "Vehicle is not PAID. Exit release cancelled and vehicle remains blocked.",
+                simulator_now(),
+                plate,
+                car.get("exit_zone") or "",
+                gate
+            )
+            return
+
+        if car.get("departure_time") or car.get("status") == "LEFT":
+            return
+
+        with state_lock:
+            current = exit_active.get(gate)
+            if not current or current.get("plate") != plate:
+                return
+            sent = bool(current.get("sent"))
+
+        if sent:
+            # PAID vehicle has received leavepark. Keep gate open until the
+            # real ExitSpot CarOut webhook confirms it physically left.
+            row = component_row(gate, "gate") or {}
+            if int(row.get("broken") or 0) or int(row.get("under_maintenance") or 0):
+                upsert_alert(
+                    f"EXIT_GATE_FAILED_DURING_CROSSING:{plate}",
+                    "CRITICAL",
+                    "EXIT GATE FAILED DURING CROSSING",
+                    f"{gate} became unavailable while paid vehicle {plate} was leaving.",
+                    simulator_now(),
+                    plate,
+                    car.get("exit_zone") or "",
+                    gate
+                )
+                continue
+
+            live_state = refresh_live_gate_state(gate).strip().lower()
+            if live_state not in ("open", "opening"):
+                try:
+                    component_action("gate", gate, "open", "system", simulator_now())
+                    audit(
+                        "system",
+                        "EXIT_GATE_HOLD_OPEN",
+                        plate,
+                        f"Re-opened {gate}; waiting for real ExitSpot CarOut.",
+                        "OK",
+                        simulator_now()
+                    )
+                except Exception as e:
+                    audit(
+                        "system",
+                        "EXIT_GATE_HOLD_OPEN",
+                        plate,
+                        str(e),
+                        "ERROR",
+                        simulator_now()
+                    )
+            continue
+
+        # PAID but never released through this candidate barrier.
+        if time.time() - started < LANE_DISCOVERY_TIMEOUT_SEC:
+            continue
+
+        with state_lock:
+            current = exit_active.get(gate)
+            if not current or current.get("plate") != plate:
+                return
+            if current.get("sent"):
+                continue
+            exit_active.pop(gate, None)
+
+        try:
+            auto_restore_gate_api_baseline(gate, "system", simulator_now())
+        except Exception:
+            pass
+
+        _queue_paid_exit_on_next_gate(
+            plate,
+            gate,
+            f"{gate} never produced a confirmed Open release within "
+            f"{LANE_DISCOVERY_TIMEOUT_SEC:.1f}s"
+        )
+        return
 
 
 def process_paid_exit_gate(gate):
     with state_lock:
         if gate in exit_active or not paid_exit_queues[gate]:
             return
+        plate = paid_exit_queues[gate][0]
 
-    blocker = gate_has_unpaid_blocker(gate)
-    if blocker:
-        upsert_alert(
-            f"EXIT_BLOCKED:{gate}", "CRITICAL", "EXIT LANE BLOCKED",
-            f"{blocker} has not completed valid payment. Gate {gate} remains closed.",
-            simulator_now(), blocker, component=gate
+    car = get_car(plate) or {}
+
+    if not gate_traffic_allowed(refresh_live=True):
+        upsert_car(
+            plate,
+            status="PAID_GATE_LOCKDOWN",
+            decision="Global barrier lockdown before exit release"
         )
         return
-    resolve_alert(f"EXIT_BLOCKED:{gate}", simulator_now())
+
+    # Gate release is permitted only for the physically-front PAID vehicle.
+    exit_spot = car.get("exit_spot")
+    if (
+        car.get("payment_status") != "PAID"
+        or not exit_spot
+        or physical_exit_front(exit_spot) != plate
+    ):
+        return
 
     with state_lock:
-        if not paid_exit_queues[gate]:
+        # Re-check under lock then consume from paid-ready queue.
+        if gate in exit_active or not paid_exit_queues[gate]:
             return
-        plate = paid_exit_queues[gate].pop(0)
+        if paid_exit_queues[gate][0] != plate:
+            return
+        paid_exit_queues[gate].pop(0)
         exit_active[gate] = {"plate": plate, "sent": False}
 
-    upsert_car(plate, status="PAID_WAITING_GATE")
+    upsert_car(plate, status="PAID_WAITING_GATE", exit_gate=gate)
+
     try:
         gate_row = component_row(gate, "gate") or {}
-        if str(gate_row.get("state") or "").lower() in ("open", "opening"):
-            # The barrier is already open from the previous authorised car.
-            # Send ONLY this already-paid vehicle; unpaid cars never enter this queue.
+        if int(gate_row.get("broken") or 0):
+            raise RuntimeError(f"{gate} is broken")
+        if int(gate_row.get("under_maintenance") or 0):
+            raise RuntimeError(f"{gate} is under maintenance")
+
+        if gate_physically_open(gate):
+            latest = get_car(plate) or {}
+            if latest.get("payment_status") != "PAID":
+                raise RuntimeError(
+                    f"Payment interlock blocked exit for {plate}: "
+                    f"status={latest.get('payment_status')}"
+                )
             send_car(plate, "leavepark")
             with state_lock:
                 if gate in exit_active:
                     exit_active[gate]["sent"] = True
             audit(
-                "system", "PAID_EXIT_FAST_PATH", plate,
-                f"{gate} already open; released paid vehicle only",
-                "OK", simulator_now()
+                "system",
+                "PAID_EXIT_FAST_PATH",
+                plate,
+                f"{gate}=Open confirmed by simulator API; released physically-front PAID vehicle.",
+                "OK",
+                simulator_now()
             )
         else:
             component_action("gate", gate, "open", "system", simulator_now())
+
+        threading.Thread(
+            target=delayed_paid_exit_release,
+            args=(gate, plate),
+            daemon=True
+        ).start()
+
+        threading.Thread(
+            target=exit_lane_discovery_watch,
+            args=(gate, plate),
+            daemon=True
+        ).start()
+
     except Exception as e:
         with state_lock:
             exit_active.pop(gate, None)
-            paid_exit_queues[gate].insert(0, plate)
-        upsert_alert(
-            f"EXIT_GATE:{gate}", "CRITICAL", "EXIT GATE FAILURE",
-            f"Paid vehicle {plate} cannot be released: {e}",
-            simulator_now(), plate, component=gate
-        )
+
+        # Keep payment accepted. Try another REAL healthy barrier candidate
+        # for this ExitSpot rather than asking the car to pay again.
+        _queue_paid_exit_on_next_gate(plate, gate, str(e))
 
 
-def verify_payment(plate, amount):
+
+
+def verify_payment(plate, received_amount):
+    """
+    Multi-factor verification copied from the supplied reference payment flow:
+
+      1) vehicle must be tracked from entry
+      2) amount must exactly match PARKMIND's stored expected amount
+      3) payment must not already have been accepted
+      4) vehicle must be in a legitimate exit/payment state
+    """
     car = get_car(plate)
-    if not car or not car.get("entry_time"):
-        return False, "UNTRACKED_VEHICLE"
-    if car.get("status") not in ("AT_EXIT", "PAYMENT_PENDING", "PAYMENT_HOLD"):
-        return False, f"BAD_STATUS:{car.get('status')}"
+    if not car:
+        return False, "GHOST_CAR"
+
+    factors = []
+
+    if not car.get("entry_time"):
+        return False, "GHOST_CAR_NO_ENTRY"
+    factors.append("TRACKED=OK")
+
+    expected = float(car.get("expected_amount") or 0)
+    received_amount = float(received_amount or 0)
+
+    if abs(received_amount - expected) > 0.001:
+        if received_amount < expected:
+            return (
+                False,
+                f"INSUFFICIENT_FUNDS(expected={expected}, received={received_amount})"
+            )
+        return False, f"AMOUNT_MISMATCH(expected={expected}, received={received_amount})"
+    factors.append(f"AMOUNT_MATCH=OK({expected})")
+
     if car.get("payment_status") == "PAID":
         return False, "DOUBLE_PAYMENT"
-    expected = float(car.get("expected_amount") or 0)
-    if abs(float(amount) - expected) > 0.001:
-        if float(amount) < expected:
-            return False, f"INSUFFICIENT_FUNDS expected={expected} received={amount}"
-        return False, f"AMOUNT_MISMATCH expected={expected} received={amount}"
-    return True, "OK"
+    factors.append("NOT_DOUBLE=OK")
+
+    allowed = (
+        "AT_EXIT",
+        "PAYMENT_PENDING",
+        "WAITING_TO_CHARGE",
+        "PAYMENT_HOLD",
+        "TO_EXIT",
+        "CHARGE_ERROR",
+    )
+    if car.get("status") not in allowed:
+        return False, f"BAD_STATUS({car.get('status')})"
+    factors.append("STATUS_OK=OK")
+
+    return True, " | ".join(factors)
+
+
+def physical_exit_front(exit_spot):
+    with state_lock:
+        queue = physical_exit_queues.get(exit_spot) or []
+        return queue[0] if queue else None
+
+
+def add_to_physical_exit_queue(exit_spot, plate):
+    with state_lock:
+        queue = physical_exit_queues[exit_spot]
+        if plate not in queue:
+            queue.append(plate)
+        return queue[0] == plate
+
+
+def remove_from_physical_exit_queue(exit_spot, plate):
+    with state_lock:
+        queue = physical_exit_queues.get(exit_spot) or []
+        if plate in queue:
+            queue.remove(plate)
+        next_plate = queue[0] if queue else None
+        if not queue and exit_spot in physical_exit_queues:
+            physical_exit_queues.pop(exit_spot, None)
+        return next_plate
+
+
+def request_payment_now(plate):
+    """
+    Send the simulator charge command using the already-calculated amounts.
+    Does not release any gate.
+    """
+    car = get_car(plate) or {}
+    if car.get("payment_status") == "PAID":
+        return
+
+    parking_cost = float(car.get("parking_cost") or 0)
+    charging_cost = float(car.get("charging_cost") or 0)
+
+    upsert_car(
+        plate,
+        payment_status="REQUESTED",
+        status="PAYMENT_PENDING"
+    )
+    charge_car(plate, parking_cost, charging_cost)
+
+
+def payment_retry_watch(plate):
+    """
+    Reference behaviour:
+    while the vehicle remains in the exit/payment flow and is not PAID,
+    retry the legitimate simulator charge request after a short delay.
+
+    A valid payment webhook stops this loop automatically.
+    """
+    time.sleep(EXIT_PAYMENT_RETRY_SEC)
+
+    car = get_car(plate)
+    if not car:
+        return
+    if car.get("payment_status") == "PAID":
+        return
+    if car.get("departure_time"):
+        return
+
+    if car.get("status") not in (
+        "AT_EXIT",
+        "PAYMENT_PENDING",
+        "PAYMENT_HOLD",
+        "TO_EXIT",
+        "CHARGE_ERROR",
+    ):
+        return
+
+    audit(
+        "system",
+        "PAYMENT_RETRY",
+        plate,
+        "Vehicle still unpaid in exit flow; retrying simulator charge request.",
+        "RETRY",
+        simulator_now()
+    )
+
+    try:
+        request_payment_now(plate)
+    except Exception as e:
+        upsert_car(
+            plate,
+            payment_status="CHARGE_ERROR",
+            status="PAYMENT_HOLD"
+        )
+        car = get_car(plate) or {}
+        upsert_alert(
+            f"PAYMENT:{plate}",
+            "HIGH",
+            "PAYMENT REQUEST FAILED",
+            str(e),
+            simulator_now(),
+            plate,
+            car.get("exit_zone") or "",
+            car.get("exit_gate") or ""
+        )
+
+    threading.Thread(
+        target=payment_retry_watch,
+        args=(plate,),
+        daemon=True
+    ).start()
+
+
+def queue_paid_vehicle_for_release(plate):
+    """
+    Only the FRONT vehicle of its physical ExitSpot queue may enter the
+    gate-release stage. This is the key behaviour from the reference system.
+    """
+    car = get_car(plate) or {}
+    if car.get("payment_status") != "PAID":
+        return False
+
+    if not gate_traffic_allowed(refresh_live=True):
+        upsert_car(
+            plate,
+            status="PAID_GATE_LOCKDOWN",
+            decision="Payment accepted; exit blocked until every barrier is healthy"
+        )
+        return False
+
+    exit_spot = car.get("exit_spot")
+    if not exit_spot:
+        return False
+
+    if physical_exit_front(exit_spot) != plate:
+        audit(
+            "system",
+            "PAID_WAITING_PHYSICAL_QUEUE",
+            plate,
+            f"Paid, but waiting behind the front vehicle at {exit_spot}.",
+            "WAIT",
+            simulator_now()
+        )
+        upsert_car(plate, status="PAID_WAITING_GATE")
+        return False
+
+    gate = car.get("exit_gate")
+    if not gate:
+        candidates = [
+            g for _, g, _ in candidate_gates_for_sensor(exit_spot, "exit")
+        ]
+        gate = candidates[0] if candidates else None
+        if gate:
+            upsert_car(plate, exit_gate=gate)
+
+    if not gate:
+        upsert_alert(
+            f"EXIT_NO_GATE:{plate}",
+            "CRITICAL",
+            "PAID CAR HAS NO EXIT GATE",
+            "Payment is valid, but no healthy simulator barrier candidate is available for this ExitSpot.",
+            simulator_now(),
+            plate,
+            car.get("exit_zone") or ""
+        )
+        return False
+
+    with state_lock:
+        if plate not in paid_exit_queues[gate]:
+            paid_exit_queues[gate].append(plate)
+
+    process_paid_exit_gate(gate)
+    return True
+
+
+def continue_physical_exit_queue(exit_spot):
+    """
+    After the front car physically leaves, immediately continue with the next
+    car at that SAME ExitSpot, exactly like the supplied reference flow.
+    """
+    next_plate = physical_exit_front(exit_spot)
+    if not next_plate:
+        return
+
+    car = get_car(next_plate) or {}
+
+    if car.get("payment_status") == "PAID":
+        queue_paid_vehicle_for_release(next_plate)
+        return
+
+    # If the next car is still unpaid, do NOT release it. Nudge its payment
+    # request and leave the physical queue blocked behind that vehicle.
+    try:
+        request_payment_now(next_plate)
+    except Exception as e:
+        upsert_car(
+            next_plate,
+            payment_status="CHARGE_ERROR",
+            status="PAYMENT_HOLD"
+        )
+        upsert_alert(
+            f"PAYMENT:{next_plate}",
+            "HIGH",
+            "PAYMENT REQUEST FAILED",
+            str(e),
+            simulator_now(),
+            next_plate,
+            car.get("exit_zone") or "",
+            car.get("exit_gate") or ""
+        )
 
 
 # ============================================================
 # CO SAFETY + ENERGY POLICY
 # ============================================================
+
 def danger_truthy(value):
+    # Simulator CO event levels include Safe, Mid, High, Critical.
+    # Fans should run from Mid upward (CO is already >= the documented 50 threshold).
     return str(value).strip().lower() in (
-        "1", "true", "danger", "high", "critical", "yes", "unsafe"
+        "1", "true", "danger", "mid", "moderate",
+        "high", "critical", "yes", "unsafe"
     )
 
 
@@ -1330,24 +3669,24 @@ def apply_light_policy(sim_time):
 # PREVENTIVE MAINTENANCE
 # ============================================================
 def component_health(row):
-    if int(row.get("broken") or 0):
-        return 0
-    if int(row.get("under_maintenance") or 0):
-        return 20
+    """
+    Returns ONLY simulator-backed life percentage when available.
 
-    kind = row["kind"]
-    cycle_limit = MAINT_CYCLES.get(kind)
-    runtime_limit = MAINT_RUNTIME_SECONDS.get(kind)
-    wear = 0.0
-    if cycle_limit:
-        wear = max(wear, int(row.get("cycles") or 0) / max(1, cycle_limit))
-    if runtime_limit:
-        wear = max(wear, int(row.get("runtime_seconds") or 0) / max(1, runtime_limit))
-    return max(0, round(100 * (1 - min(wear, 1.0))))
+    None means the simulator API did not expose a life percentage or enough
+    API fields to calculate one. Never manufacture a percentage from local
+    policy thresholds.
+    """
+    value = row.get("api_life_pct")
+    return float(value) if value is not None else None
 
 
 def safe_for_maintenance(row):
+    """Safety gate before any repair command is sent."""
     kind = row["kind"]
+
+    if int(row.get("under_maintenance") or 0):
+        return False, "Already under maintenance"
+
     if kind == "spot":
         conn = db()
         reserved = conn.execute(
@@ -1355,68 +3694,77 @@ def safe_for_maintenance(row):
             (row["name"],)
         ).fetchone()
         conn.close()
-        return row["state"] != "Occupied" and not reserved
+        if str(row.get("state") or "").lower() == "occupied":
+            return False, "Parking spot is occupied"
+        if reserved:
+            return False, "Parking spot is reserved for an incoming vehicle"
+        return True, "Spot is free and unreserved"
+
     if kind == "gate":
         with state_lock:
             busy = row["name"] in entry_active or row["name"] in exit_active
-        return str(row["state"]).lower() == "closed" and not busy
+        if busy:
+            return False, "Gate is handling an active vehicle"
+        if int(row.get("broken") or 0):
+            return True, "Broken gate is idle; corrective repair can start"
+        if str(row.get("state") or "").lower() != "closed":
+            return False, "Close and idle the gate before preventive repair"
+        return True, "Gate is closed and idle"
+
     if kind == "fan":
+        # A broken fan should be repaired urgently even during CO danger because
+        # it is already unavailable. A healthy fan should not be taken offline
+        # for preventive work while its zone needs ventilation.
+        if int(row.get("broken") or 0):
+            return True, "Broken fan should be restored immediately"
         conn = db()
         z = conn.execute(
             "SELECT danger FROM zones WHERE name=?",
-            (row["zone"],)
+            (row.get("zone") or "",)
         ).fetchone()
         conn.close()
-        return str(row["state"]).lower() != "on" and not (z and danger_truthy(z["danger"]))
+        if z and danger_truthy(z["danger"]):
+            return False, "Zone CO requires this ventilation capacity"
+        if str(row.get("state") or "").lower() == "on":
+            return False, "Turn fan off before preventive maintenance"
+        return True, "Fan is off and zone is not in a CO incident"
+
     if kind == "light":
-        return str(row["state"]).lower() != "on"
-    return False
+        return False, "Simulator documentation exposes no light repair endpoint"
+
+    return False, "Unsupported component type"
 
 
 def evaluate_preventive_maintenance(sim_time):
+    """
+    Event-driven recommendation refresh.
+
+    Preventive-maintenance due status comes from /list-alarms, not from a fake
+    locally invented life percentage. This function only enriches the alert
+    with whether a safe maintenance window exists right now.
+    """
     conn = db()
     rows = [dict(r) for r in conn.execute(
         """SELECT * FROM components
-           WHERE kind IN('spot','gate','fan','light')
-             AND broken=0 AND under_maintenance=0"""
+           WHERE maintenance_required=1
+             AND broken=0"""
     ).fetchall()]
     conn.close()
 
     for row in rows:
-        health = component_health(row)
-        key = f"MAINT_DUE:{row['kind']}:{row['name']}"
-        if health > 20:
-            resolve_alert(key, sim_time)
-            continue
-
-        reason = (
-            f"Preventive maintenance due: health={health}%, "
-            f"cycles={row['cycles']}, runtime={fmt_duration(row['runtime_seconds'])}."
-        )
+        safe, why = safe_for_maintenance(row)
+        life = component_health(row)
+        life_text = f"{life:.1f}% simulator life remaining" if life is not None else "life % not exposed by simulator API"
         upsert_alert(
-            key, "HIGH", "PREVENTIVE MAINTENANCE DUE",
-            reason, sim_time, zone=row["zone"], component=row["name"]
+            f"MAINT_DUE:{row['name']}",
+            "HIGH",
+            "SIMULATOR MAINTENANCE REQUIRED",
+            f"{row.get('maintenance_problem') or 'Require Maintenance'}; "
+            f"{life_text}; {'REPAIR NOW' if safe else 'WAIT'} — {why}.",
+            sim_time,
+            zone=row.get("zone") or "",
+            component=row["name"]
         )
-
-        # Efficient repair: only attempt automatically in a safe idle window.
-        if safe_for_maintenance(row):
-            try:
-                component_action(row["kind"], row["name"], "repair", "system", sim_time)
-                conn = db()
-                conn.execute(
-                    """INSERT INTO maintenance_actions(
-                       created_at,simulator_time,actor,component,kind,reason,action,result
-                       ) VALUES(?,?,?,?,?,?,?,?)""",
-                    (
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        sim_time, "system", row["name"], row["kind"],
-                        reason, "PREVENTIVE_REPAIR", "COMMAND_SENT"
-                    )
-                )
-                conn.commit()
-                conn.close()
-            except Exception as e:
-                audit("system", "PREVENTIVE_REPAIR_FAILED", row["name"], str(e), "ERROR", sim_time)
 
 
 # ============================================================
@@ -1447,8 +3795,48 @@ def handle_gate_action(data, sim_time):
         incoming = entry_active.get(name)
         outgoing = exit_active.get(name)
 
-    if incoming and action in ("Opening", "Open") and not incoming["sent"]:
+    if incoming and action == "Open" and not incoming["sent"]:
         try:
+            # Even a physically Open gate cannot admit a car while ANY
+            # simulator barrier is broken/under maintenance.
+            if not gate_traffic_allowed(refresh_live=True, sim_time=sim_time):
+                plate = incoming["plate"]
+                release_reservation(plate=plate)
+                with state_lock:
+                    entry_active.pop(name, None)
+                upsert_car(
+                    plate,
+                    assigned_spot=None,
+                    status="GATE_LOCKDOWN_ENTRY",
+                    decision="Global barrier lockdown at gate-open event"
+                )
+                return
+
+            target_zone = target_zone_for_spot(incoming["spot"])
+
+            # Gate webhook says fully Open. Re-check live API before releasing.
+            if not gate_physically_open(name):
+                audit(
+                    "system",
+                    "ENTRY_RELEASE_BLOCKED_GATE_NOT_OPEN",
+                    incoming["plate"],
+                    f"{name} webhook reported Open but /list-barriers did not confirm Open.",
+                    "BLOCKED",
+                    sim_time
+                )
+                return
+            if not zone_access_is_open(target_zone):
+                prepare_zone_access_for_car(
+                    incoming["plate"], incoming["spot"]
+                )
+                audit(
+                    "system", "ENTRY_WAITING_FOR_ZONE_ACCESS",
+                    incoming["plate"],
+                    f"entry gate open; waiting for target_zone={target_zone}",
+                    "WAIT", sim_time
+                )
+                return
+
             send_car(incoming["plate"], incoming["spot"])
             with state_lock:
                 if name in entry_active:
@@ -1460,8 +3848,41 @@ def handle_gate_action(data, sim_time):
                 str(e), sim_time, incoming["plate"], component=name
             )
 
-    if outgoing and action in ("Opening", "Open") and not outgoing["sent"]:
+    if outgoing and action == "Open" and not outgoing["sent"]:
         try:
+            if not gate_traffic_allowed(refresh_live=True, sim_time=sim_time):
+                plate = outgoing["plate"]
+                with state_lock:
+                    exit_active.pop(name, None)
+                upsert_car(
+                    plate,
+                    status="PAID_GATE_LOCKDOWN",
+                    decision="Global barrier lockdown at exit gate-open event"
+                )
+                return
+
+            if not gate_physically_open(name):
+                audit(
+                    "system",
+                    "PAID_EXIT_RELEASE_BLOCKED_GATE_NOT_OPEN",
+                    outgoing["plate"],
+                    f"{name} webhook reported Open but /list-barriers did not confirm Open.",
+                    "BLOCKED",
+                    sim_time
+                )
+                return
+            latest = get_car(outgoing["plate"]) or {}
+            if latest.get("payment_status") != "PAID":
+                audit(
+                    "system",
+                    "EXIT_RELEASE_BLOCKED_UNPAID",
+                    outgoing["plate"],
+                    f"{name}=Open but payment_status={latest.get('payment_status')}; no leavepark command sent.",
+                    "BLOCKED",
+                    sim_time
+                )
+                return
+
             send_car(outgoing["plate"], "leavepark")
             with state_lock:
                 if name in exit_active:
@@ -1491,22 +3912,56 @@ def handle_car_event(data, sim_time):
         return
 
     if spot_type == "EntrySpot" and direction == "CarOut":
-        car = get_car(plate)
-        gate = gate_for_sensor(spot_name, "entry")
-        if gate:
+        car = get_car(plate) or {}
+        active_gate = find_active_entry_gate(plate)
+
+        # IMPORTANT:
+        # EntrySpot CarOut can also happen when PARKMIND intentionally rejects
+        # a car with goto/leavepark. That is NOT proof that an entrance barrier
+        # worked. Only learn/close a gate when this plate actually had an active
+        # parking-entry gate trial and an assigned parking bay.
+        successful_entry_crossing = bool(
+            active_gate
+            and car.get("assigned_spot")
+            and car.get("status") not in ("NO_SAFE_SPACE", "ENTRY_HOLD")
+        )
+
+        if successful_entry_crossing:
+            gate = active_gate
+            remember_lane_mapping(
+                spot_name, "entry", gate,
+                confidence="CONFIRMED",
+                source="EntrySpot CarOut during parking admission"
+            )
+            resolve_alert(f"ENTRY_MAP:{spot_name}", sim_time)
+            resolve_alert(f"ENTRY_DISCOVERY:{plate}", sim_time)
+
             with state_lock:
-                if gate in entry_active and entry_active[gate]["plate"] == plate:
+                if gate in entry_active and entry_active[gate].get("plate") == plate:
                     entry_active.pop(gate, None)
                 has_next = bool(entry_queues[gate])
+
+            upsert_car(plate, status="TO_SPOT")
+
             if has_next:
                 process_entry_gate(gate)
             else:
-                try:
-                    component_action("gate", gate, "close", "system", sim_time)
-                except Exception:
-                    pass
-        if car:
-            upsert_car(plate, status="TO_SPOT")
+                threading.Thread(
+                    target=delayed_restore_entry_gate_if_idle,
+                    args=(gate,),
+                    daemon=True
+                ).start()
+
+        else:
+            audit(
+                "system", "ENTRY_SENSOR_CAROUT_NO_GATE_CONFIRM",
+                plate,
+                f"{spot_name} CarOut observed with status={car.get('status')}; "
+                "not treated as proof of an entrance-gate mapping.",
+                "IGNORED_FOR_MAPPING",
+                sim_time
+            )
+
         return
 
     if spot_type == "Park":
@@ -1547,15 +4002,30 @@ def handle_car_event(data, sim_time):
                 parked_time=sim_time, status="PARKED"
             )
             schedule_exit(plate, planned or car.get("planned_minutes") or 1)
+
+            # Physical Park CarIn proves the car reached the target zone/bay.
+            # Target-zone barriers may now return to their API startup state,
+            # unless another in-flight car still needs the same zone.
+            release_zone_access_for_car(plate, zone)
         else:
             update_component_state(spot_name, "spot", "Free", sim_time=sim_time)
         return
 
     if spot_type == "ExitSpot" and direction == "CarIn":
-        car = get_car(plate)
-        gate = gate_for_sensor(spot_name, "exit")
+        ensure_level2_topology_ready(f"exit:{spot_name}")
 
-        # Real-world exception: car appears at exit without trusted entry history.
+        car = get_car(plate)
+        exit_candidates = [
+            g for _, g, _ in candidate_gates_for_sensor(spot_name, "exit")
+        ]
+        gate = exit_candidates[0] if exit_candidates else None
+        set_state(f"exit_tried:{plate}", "")
+
+        # Physical queue first. Multiple Level 2 ExitSpots each get their own
+        # queue, so one exit lane does not falsely serialize every zone.
+        is_front = add_to_physical_exit_queue(spot_name, plate)
+
+        # Manual/untracked car: never invent a payment history.
         if not car or not car.get("entry_time"):
             upsert_car(
                 plate,
@@ -1569,10 +4039,40 @@ def handle_car_event(data, sim_time):
             )
             upsert_alert(
                 f"UNREGISTERED_EXIT:{plate}",
-                "CRITICAL", "UNREGISTERED VEHICLE AT EXIT",
-                "No trusted entry timestamp exists. Gate remains closed; security/operator verification is required.",
-                sim_time, plate, zone, gate or ""
+                "CRITICAL",
+                "UNREGISTERED VEHICLE AT EXIT",
+                "No trusted entry timestamp exists. Vehicle remains blocked for operator/security verification.",
+                sim_time,
+                plate,
+                zone,
+                gate or ""
             )
+            return
+
+        # If a valid payment somehow arrived before this CarIn was processed,
+        # the front vehicle may continue immediately.
+        if car.get("payment_status") == "PAID":
+            upsert_car(
+                plate,
+                exit_arrival_time=sim_time,
+                exit_spot=spot_name,
+                exit_zone=zone,
+                exit_gate=gate,
+                status="PAID_WAITING_GATE"
+            )
+            if is_front:
+                queue_paid_vehicle_for_release(plate)
+            return
+
+        # Duplicate/repeated ExitSpot CarIn webhook: do not double-calculate
+        # or double-charge. The existing retry watcher owns payment.
+        if car.get("payment_status") in (
+            "REQUESTED",
+            "PAYMENT_PENDING",
+            "PAYMENT_HOLD",
+            "WAITING_TO_CHARGE",
+            "CHARGE_ERROR",
+        ) and car.get("exit_arrival_time"):
             return
 
         seconds, minutes, parking, charging = calculate_charge(plate, sim_time)
@@ -1593,29 +4093,58 @@ def handle_car_event(data, sim_time):
             status="AT_EXIT"
         )
 
-        if not gate:
-            upsert_alert(
-                f"EXIT_MAP:{spot_name}", "CRITICAL", "EXIT GATE MAPPING REQUIRED",
-                f"PARKMIND cannot safely identify the gate serving exit sensor {spot_name}.",
-                sim_time, plate, zone
-            )
+        total_multiplier = (
+            ELECTRIC_TOTAL_MULTIPLIER
+            if "electric" in str(car.get("car_type") or "").lower()
+            else 1.0
+        )
+        audit(
+            "system",
+            "AT_EXIT",
+            plate,
+            (
+                f"entry_time={car.get('entry_time')}; "
+                f"parked_time={car.get('parked_time')}; "
+                f"exit_arrival_time={sim_time}; "
+                f"billable_seconds={seconds}; billable_minutes={minutes}; "
+                f"parking={parking}; charging={charging}; "
+                f"total={expected}; price_multiplier={total_multiplier}x"
+            ),
+            "PAYMENT_REQUIRED",
+            sim_time
+        )
 
-        def request_charge():
-            time.sleep(1.2)
+        # Reference implementation sends the first charge almost immediately.
+        def delayed_charge():
+            time.sleep(0.1)
             latest = get_car(plate)
             if not latest or latest.get("payment_status") != "WAITING_TO_CHARGE":
                 return
             try:
-                upsert_car(plate, payment_status="REQUESTED", status="PAYMENT_PENDING")
-                charge_car(plate, parking, charging)
+                request_payment_now(plate)
             except Exception as e:
-                upsert_car(plate, payment_status="CHARGE_ERROR", status="PAYMENT_HOLD")
+                upsert_car(
+                    plate,
+                    payment_status="CHARGE_ERROR",
+                    status="PAYMENT_HOLD"
+                )
                 upsert_alert(
-                    f"PAYMENT:{plate}", "CRITICAL", "PAYMENT REQUEST FAILED",
-                    str(e), sim_time, plate, zone
+                    f"PAYMENT:{plate}",
+                    "HIGH",
+                    "PAYMENT REQUEST FAILED",
+                    str(e),
+                    sim_time,
+                    plate,
+                    zone,
+                    gate or ""
                 )
 
-        threading.Thread(target=request_charge, daemon=True).start()
+        threading.Thread(target=delayed_charge, daemon=True).start()
+        threading.Thread(
+            target=payment_retry_watch,
+            args=(plate,),
+            daemon=True
+        ).start()
         return
 
     if spot_type == "ExitSpot" and direction == "CarOut":
@@ -1624,82 +4153,156 @@ def handle_car_event(data, sim_time):
 
         if not paid:
             upsert_alert(
-                f"UNPAID_EXIT:{plate}", "CRITICAL", "UNPAID VEHICLE DEPARTED",
+                f"UNPAID_EXIT:{plate}",
+                "CRITICAL",
+                "UNPAID VEHICLE DEPARTED",
                 "Simulator reported ExitSpot CarOut without a valid PARKMIND payment authorization.",
-                sim_time, plate, zone
+                sim_time,
+                plate,
+                zone
             )
+
+        total_stay_seconds = sim_seconds_between(car.get("entry_time"), sim_time)
+        total_stay_minutes = (
+            max(1, math.ceil(total_stay_seconds / 60))
+            if total_stay_seconds > 0 else 0
+        )
 
         upsert_car(
             plate,
             departure_time=sim_time,
+            total_stay_seconds=total_stay_seconds,
+            total_stay_minutes=total_stay_minutes,
             status="LEFT" if paid else "ESCAPED_UNPAID"
         )
 
-        gate = car.get("exit_gate") or gate_for_sensor(spot_name, "exit")
+        audit(
+            "system",
+            "DEPARTURE_TIME_CONFIRMED",
+            plate,
+            (
+                f"entry_time={car.get('entry_time')}; "
+                f"exit_arrival_time={car.get('exit_arrival_time')}; "
+                f"departure_time={sim_time}; "
+                f"total_stay_seconds={total_stay_seconds}; "
+                f"billable_seconds={car.get('billable_seconds') or 0}; "
+                f"expected={car.get('expected_amount') or 0}; "
+                f"paid={car.get('actual_paid') or 0}"
+            ),
+            "OK" if paid else "UNPAID_ESCAPE_RECORDED",
+            sim_time
+        )
+
+        gate = (
+            find_active_exit_gate(plate)
+            or car.get("exit_gate")
+            or gate_for_sensor(spot_name, "exit")
+        )
+
         if gate:
+            if paid:
+                remember_lane_mapping(
+                    spot_name,
+                    "exit",
+                    gate,
+                    confidence="CONFIRMED",
+                    source="ExitSpot CarOut after valid payment"
+                )
+                resolve_alert(f"EXIT_MAP:{spot_name}", sim_time)
+                resolve_alert(f"EXIT_DISCOVERY:{plate}", sim_time)
+
             with state_lock:
-                if gate in exit_active and exit_active[gate]["plate"] == plate:
+                if gate in exit_active and exit_active[gate].get("plate") == plate:
                     exit_active.pop(gate, None)
 
-            # If another PAID vehicle is waiting and no unpaid blocker exists,
-            # keep throughput moving. Otherwise close the barrier.
-            if paid_exit_queues[gate] and not gate_has_unpaid_blocker(gate):
-                process_paid_exit_gate(gate)
-            else:
+                # Remove any stale paid-release queue copy of this plate.
+                if plate in paid_exit_queues.get(gate, []):
+                    paid_exit_queues[gate] = [
+                        p for p in paid_exit_queues[gate] if p != plate
+                    ]
+
+        # Physical queue progression is driven by REAL ExitSpot CarOut.
+        remove_from_physical_exit_queue(spot_name, plate)
+        set_state(f"exit_tried:{plate}", "")
+
+        continue_physical_exit_queue(spot_name)
+
+        # Only close the gate when no active release is using it.
+        if gate:
+            with state_lock:
+                gate_busy = gate in exit_active
+            if not gate_busy:
                 try:
-                    component_action("gate", gate, "close", "system", sim_time)
+                    auto_restore_gate_api_baseline(gate, "system", sim_time)
                 except Exception:
                     pass
 
+        # A real departure frees exit approach capacity for another parked car.
         dispatch_exit_requests()
         return
 
 
 def handle_payment(data, sim_time):
     plate = str(data.get("CarPlateNumber") or "").strip()
-    amount = float(data.get("Amount") or 0)
-    ok, reason = verify_payment(plate, amount)
+    received = float(data.get("Amount") or 0)
+
+    ok, factors = verify_payment(plate, received)
 
     if not ok:
         car = get_car(plate) or {}
         upsert_car(
             plate,
-            actual_paid=amount,
+            actual_paid=received,
             payment_status="INVALID",
-            status="PAYMENT_HOLD"
+            status="PAYMENT_HOLD",
+            decision=factors
         )
         upsert_alert(
-            f"PAYMENT:{plate}", "CRITICAL", "PAYMENT NOT ACCEPTED",
-            reason, sim_time, plate,
-            car.get("exit_zone") or "", car.get("exit_gate") or ""
+            f"PAYMENT:{plate}",
+            "HIGH",
+            "PAYMENT NOT ACCEPTED",
+            factors,
+            sim_time,
+            plate,
+            car.get("exit_zone") or "",
+            car.get("exit_gate") or ""
         )
-        audit("system", "PAYMENT_REJECTED", plate, reason, "BLOCKED", sim_time)
+        audit(
+            "system",
+            "PAYMENT_REJECTED",
+            plate,
+            f"received={received}; {factors}",
+            "GATE_REMAINS_CLOSED",
+            sim_time
+        )
         return
 
-    car = get_car(plate)
+    car = get_car(plate) or {}
+
     upsert_car(
         plate,
-        actual_paid=amount,
+        actual_paid=received,
         payment_time=sim_time,
         payment_status="PAID",
-        status="PAID_WAITING_GATE"
+        status="PAID_WAITING_GATE",
+        decision=factors
     )
+
     resolve_alert(f"PAYMENT:{plate}", sim_time)
-    audit("system", "PAYMENT_ACCEPTED", plate, f"amount={amount}", "OK", sim_time)
+    audit(
+        "system",
+        "PAYMENT_ACCEPTED",
+        plate,
+        f"received={received}; {factors}",
+        "OK",
+        sim_time
+    )
 
-    gate = car.get("exit_gate")
-    if not gate:
-        upsert_alert(
-            f"EXIT_NO_GATE:{plate}", "CRITICAL", "PAID CAR HAS NO EXIT GATE",
-            "Payment is valid but exit topology is unresolved; vehicle remains safely held.",
-            sim_time, plate, car.get("exit_zone") or ""
-        )
-        return
+    # The supplied reference releases a paid car only when it is physically
+    # first in the exit queue. Same rule here, but independently per ExitSpot.
+    queue_paid_vehicle_for_release(plate)
 
-    with state_lock:
-        if plate not in paid_exit_queues[gate]:
-            paid_exit_queues[gate].append(plate)
-    process_paid_exit_gate(gate)
+
 
 
 def handle_component_broken(data, sim_time):
@@ -1709,6 +4312,16 @@ def handle_component_broken(data, sim_time):
         return
 
     update_component_state(name, kind, broken=True, under=False, sim_time=sim_time)
+    conn = db()
+    conn.execute(
+        """UPDATE components
+           SET maintenance_required=1,
+               maintenance_problem='BROKEN - corrective repair required'
+           WHERE name=? AND kind=?""",
+        (name, kind)
+    )
+    conn.commit()
+    conn.close()
     row = component_row(name, kind)
     upsert_alert(
         f"BROKEN:{kind}:{name}", "CRITICAL", "COMPONENT BROKEN",
@@ -1716,6 +4329,13 @@ def handle_component_broken(data, sim_time):
         sim_time, zone=(row or {}).get("zone", ""), component=name
     )
     audit("system", "COMPONENT_BROKEN", name, kind, "ISOLATED", sim_time)
+
+    if kind == "gate":
+        # The signed component_broken webhook is authoritative now; do not let
+        # a potentially lagging list endpoint overwrite it before lockdown.
+        locked, gate_problems = gate_lockdown_status(refresh_live=False)
+        if locked:
+            hold_unreleased_gate_traffic(gate_problems, sim_time)
 
     # CO safety failover: if a fan breaks during an unsafe zone, try another healthy fan.
     if kind == "fan" and row:
@@ -1735,18 +4355,107 @@ def handle_component_fixed(data, sim_time):
     if not name or not kind:
         return
 
+    # RepairCost is supplied by the simulator's component_fixed webhook.
+    # We do not estimate or invent it.
+    repair_cost = _num(data.get("RepairCost"))
+
     conn = db()
+    before = conn.execute(
+        "SELECT broken FROM components WHERE name=? AND kind=?",
+        (name, kind)
+    ).fetchone()
+
+    pending = conn.execute(
+        """SELECT * FROM maintenance_actions
+           WHERE component=?
+             AND status IN('COMMAND_SENT','IN_PROGRESS','PENDING')
+           ORDER BY id DESC LIMIT 1""",
+        (name,)
+    ).fetchone()
+
     conn.execute(
-        """UPDATE components SET broken=0,under_maintenance=0,
-           cycles=0,runtime_seconds=0,on_since=NULL,last_event_time=?
+        """UPDATE components SET
+           broken=0,
+           under_maintenance=0,
+           maintenance_required=0,
+           maintenance_problem=NULL,
+           cycles=0,
+           runtime_seconds=0,
+           on_since=NULL,
+           api_life_pct=NULL,
+           api_life_source=NULL,
+           api_usage_current=NULL,
+           api_usage_limit=NULL,
+           api_runtime_hours=NULL,
+           api_runtime_limit_hours=NULL,
+           last_alarm_time=NULL,
+           last_event_time=?
            WHERE name=? AND kind=?""",
         (sim_time, name, kind)
     )
+
+    if pending:
+        duration = sim_seconds_between(pending["simulator_time"], sim_time)
+        conn.execute(
+            """UPDATE maintenance_actions SET
+               completed_simulator_time=?,
+               repair_duration_seconds=?,
+               repair_cost=?,
+               cost_source=?,
+               status='COMPLETED',
+               result='COMPONENT_FIXED_WEBHOOK'
+               WHERE id=?""",
+            (
+                sim_time,
+                duration,
+                repair_cost,
+                "Simulator component_fixed.RepairCost" if repair_cost is not None else "Simulator did not provide RepairCost",
+                pending["id"]
+            )
+        )
+    else:
+        # Component may have been repaired outside PARKMIND. Still preserve the
+        # simulator-confirmed cost and state change.
+        conn.execute(
+            """INSERT INTO maintenance_actions(
+               created_at,simulator_time,actor,component,kind,reason,action,result,
+               repair_type,status,completed_simulator_time,repair_duration_seconds,
+               repair_cost,cost_source
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                sim_time,
+                "simulator/external",
+                name,
+                kind,
+                "Component fixed event received without a PARKMIND pending repair command",
+                "REPAIR",
+                "COMPONENT_FIXED_WEBHOOK",
+                "CORRECTIVE" if before and before["broken"] else "EXTERNAL",
+                "COMPLETED",
+                sim_time,
+                0,
+                repair_cost,
+                "Simulator component_fixed.RepairCost" if repair_cost is not None else "Simulator did not provide RepairCost"
+            )
+        )
+
     conn.commit()
     conn.close()
+
     resolve_alert(f"BROKEN:{kind}:{name}", sim_time)
+    resolve_alert(f"MAINT_DUE:{name}", sim_time)
     resolve_alert(f"MAINT_DUE:{kind}:{name}", sim_time)
-    audit("system", "COMPONENT_FIXED", name, kind, "OK", sim_time)
+    audit(
+        "system", "COMPONENT_FIXED", name,
+        f"{kind}; RepairCost={repair_cost if repair_cost is not None else 'not supplied'}",
+        "OK", sim_time
+    )
+
+    if kind == "gate":
+        # One repaired gate is not enough if another barrier is still broken
+        # or under maintenance. resume_after_gate_lockdown() checks them ALL.
+        resume_after_gate_lockdown(sim_time)
 
 
 def handle_penalty(data, sim_time):
@@ -1913,40 +4622,60 @@ def control_gate(name, action):
     if action not in ("open", "close"):
         return ("Bad action", 400)
 
-    # Payment interlock: nobody can use the dashboard to bypass payment.
+    # /list-barriers does NOT expose entry/exit roles, so PARKMIND does not
+    # invent a paid-only label for a named barrier.
+    #
+    # Payment protection uses only real vehicle state already tied to this
+    # gate by the controller. Automatic exit release still happens only after
+    # a verified PAID state.
     if action == "open":
-        conn = db()
-        role_row = conn.execute(
-            "SELECT role FROM gate_roles WHERE name=?",
-            (name,)
-        ).fetchone()
-        conn.close()
-        gate_role = role_row["role"] if role_row else "unknown"
+        locked, gate_problems = gate_lockdown_status(refresh_live=True)
+        if locked:
+            mark_gate_lockdown(gate_problems, simulator_now())
+            audit(
+                session["user"],
+                "MANUAL_GATE_OPEN_BLOCKED_GLOBAL_LOCKDOWN",
+                name,
+                gate_lockdown_reason(gate_problems),
+                "DENIED",
+                simulator_now()
+            )
+            return redirect_back()
 
-        if gate_role == "exit":
-            with state_lock:
-                active = exit_active.get(name)
-            active_car = get_car(active["plate"]) if active else None
+        # API does not expose gate roles. For safety, if ANY vehicle is
+        # physically waiting at an ExitSpot without PAID status, manual OPEN is
+        # blocked for unknown barriers. Automatic entry handling is unaffected.
+        unpaid_exit_plate = None
+        with state_lock:
+            physical_fronts = [
+                q[0] for q in physical_exit_queues.values() if q
+            ]
+        for candidate_plate in physical_fronts:
+            candidate = get_car(candidate_plate) or {}
+            if candidate.get("payment_status") != "PAID":
+                unpaid_exit_plate = candidate_plate
+                break
 
-            if not active_car or active_car.get("payment_status") != "PAID":
-                audit(
-                    session["user"], "EXIT_GATE_OPEN_BLOCKED", name,
-                    "Payment interlock: no authorised PAID vehicle is active.",
-                    "DENIED", simulator_now()
-                )
-                upsert_alert(
-                    f"MANUAL_EXIT_INTERLOCK:{name}",
-                    "HIGH", "EXIT GATE OPEN BLOCKED",
-                    "Manual open denied: PARKMIND requires a valid paid vehicle before exit-gate release.",
-                    simulator_now(), component=name
-                )
-                return redirect_back()
+        if unpaid_exit_plate:
+            audit(
+                session["user"], "MANUAL_GATE_OPEN_BLOCKED_UNPAID_EXIT", name,
+                f"Unpaid vehicle {unpaid_exit_plate} is physically waiting at an ExitSpot.",
+                "DENIED", simulator_now()
+            )
+            return redirect_back()
 
         blocker = gate_has_unpaid_blocker(name)
         if blocker:
             audit(
-                session["user"], "EXIT_GATE_OPEN_BLOCKED", name,
-                f"Unpaid blocker={blocker}", "DENIED", simulator_now()
+                session["user"], "GATE_OPEN_BLOCKED", name,
+                f"Unpaid vehicle physically associated with this gate: {blocker}",
+                "DENIED", simulator_now()
+            )
+            upsert_alert(
+                f"MANUAL_GATE_INTERLOCK:{name}",
+                "HIGH", "GATE OPEN BLOCKED",
+                f"Manual open denied because {blocker} is still unpaid at its exit flow.",
+                simulator_now(), blocker, component=name
             )
             return redirect_back()
 
@@ -1957,29 +4686,6 @@ def control_gate(name, action):
             f"MANUAL_GATE:{name}", "HIGH", "GATE CONTROL FAILED",
             str(e), simulator_now(), component=name
         )
-    return redirect_back()
-
-
-@app.route("/control/payment/<plate>/retry", methods=["POST"])
-def retry_payment(plate):
-    if not require_roles("Operator", "Admin"):
-        return ("Forbidden", 403)
-    car = get_car(plate)
-    if not car:
-        return ("Unknown car", 404)
-    if car.get("status") not in ("AT_EXIT", "PAYMENT_PENDING", "PAYMENT_HOLD"):
-        return redirect_back()
-    try:
-        upsert_car(plate, payment_status="REQUESTED", status="PAYMENT_PENDING")
-        charge_car(
-            plate,
-            float(car.get("parking_cost") or 0),
-            float(car.get("charging_cost") or 0)
-        )
-        audit(session["user"], "PAYMENT_RETRY", plate, "", "OK", simulator_now())
-    except Exception as e:
-        upsert_car(plate, payment_status="CHARGE_ERROR", status="PAYMENT_HOLD")
-        audit(session["user"], "PAYMENT_RETRY", plate, str(e), "ERROR", simulator_now())
     return redirect_back()
 
 
@@ -2001,30 +4707,119 @@ def manual_exit_request(plate):
 def repair_component(kind, name):
     if not require_roles("Maintenance", "Admin"):
         return ("Forbidden", 403)
+
+    if kind not in ("spot", "gate", "fan"):
+        audit(
+            session.get("user") or "unknown",
+            "REPAIR_BLOCKED", name,
+            f"No documented repair endpoint for kind={kind}",
+            "DENIED", simulator_now()
+        )
+        return redirect_back()
+
     row = component_row(name, kind)
     if not row:
         return ("Unknown component", 404)
 
-    reason = "Authorized manual repair"
-    result = "COMMAND_SENT"
-    try:
-        component_action(kind, name, "repair", session["user"], simulator_now())
-    except Exception as e:
-        result = f"ERROR: {e}"
+    safe, safety_reason = safe_for_maintenance(row)
+    if not safe:
+        upsert_alert(
+            f"REPAIR_BLOCKED:{kind}:{name}",
+            "HIGH", "REPAIR WAITING FOR SAFE WINDOW",
+            safety_reason,
+            simulator_now(),
+            zone=row.get("zone") or "",
+            component=name
+        )
+        audit(
+            session["user"], "REPAIR_BLOCKED", name,
+            safety_reason, "DENIED", simulator_now()
+        )
+        return redirect_back()
 
     conn = db()
-    conn.execute(
+    existing = conn.execute(
+        """SELECT id FROM maintenance_actions
+           WHERE component=?
+             AND status IN('COMMAND_SENT','IN_PROGRESS','PENDING')
+           ORDER BY id DESC LIMIT 1""",
+        (name,)
+    ).fetchone()
+    conn.close()
+    if existing:
+        return redirect_back()
+
+    repair_type = (
+        "CORRECTIVE" if int(row.get("broken") or 0)
+        else "PREVENTIVE" if int(row.get("maintenance_required") or 0)
+        else "MANUAL"
+    )
+    reason = row.get("maintenance_problem") or (
+        "Broken component" if int(row.get("broken") or 0)
+        else "Authorized maintenance"
+    )
+    started = simulator_now() or None
+
+    conn = db()
+    cur = conn.execute(
         """INSERT INTO maintenance_actions(
-           created_at,simulator_time,actor,component,kind,reason,action,result
-           ) VALUES(?,?,?,?,?,?,?,?)""",
+           created_at,simulator_time,actor,component,kind,reason,action,result,
+           repair_type,status,cost_source
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            simulator_now() or None,
-            session["user"], name, kind, reason, "REPAIR", result
+            started,
+            session["user"],
+            name,
+            kind,
+            reason,
+            "REPAIR",
+            "PREPARING_COMMAND",
+            repair_type,
+            "PENDING",
+            "Awaiting simulator component_fixed.RepairCost"
         )
     )
+    action_id = cur.lastrowid
     conn.commit()
     conn.close()
+
+    try:
+        component_action(kind, name, "repair", session["user"], started)
+        conn = db()
+        conn.execute(
+            """UPDATE maintenance_actions
+               SET status='COMMAND_SENT',
+                   result='REPAIR_COMMAND_ACCEPTED'
+               WHERE id=?""",
+            (action_id,)
+        )
+        conn.commit()
+        conn.close()
+        resolve_alert(f"REPAIR_BLOCKED:{kind}:{name}", started)
+    except Exception as e:
+        conn = db()
+        conn.execute(
+            """UPDATE maintenance_actions
+               SET status='FAILED',result=?
+               WHERE id=?""",
+            (f"ERROR: {e}", action_id)
+        )
+        conn.commit()
+        conn.close()
+        audit(session["user"], "REPAIR_COMMAND_FAILED", name, str(e), "ERROR", started)
+
+    return redirect_back()
+
+
+@app.route("/control/refresh-maintenance", methods=["POST"])
+def refresh_maintenance_control():
+    if not require_roles("Maintenance", "Admin"):
+        return ("Forbidden", 403)
+    try:
+        refresh_maintenance_snapshot(f"maintenance-refresh:{session['user']}")
+    except Exception as e:
+        audit(session["user"], "MAINTENANCE_REFRESH_FAILED", "", str(e), "ERROR")
     return redirect_back()
 
 
@@ -2079,7 +4874,17 @@ if __name__ == "__main__":
     try:
         sim_login()
         sync_topology("startup")
-        print("[PARKMIND] Level 2 topology loaded from simulator APIs.")
+        released = cleanup_stale_reservations()
+
+        locked, gate_problems = gate_lockdown_status(refresh_live=True)
+        if locked:
+            hold_unreleased_gate_traffic(gate_problems, simulator_now())
+        else:
+            set_state("gate_lockdown", "0")
+        print(
+            "[PARKMIND] Level 2 topology loaded from simulator APIs. "
+            f"Stale reservations released={released}."
+        )
     except Exception as e:
         print("[PARKMIND] Simulator not ready:", e)
         print("[PARKMIND] Start/load Level 2, then use Admin/Maintenance Sync once.")
@@ -2092,6 +4897,25 @@ if __name__ == "__main__":
     print(" Maintenance: maintenance / maintenance")
     print(" Webhook:     http://127.0.0.1:8000/webhook")
     print(" Level 2: ONLY VALID SIGNED WEBHOOKS ARE PROCESSED")
+    print(" Flow: Entry -> least-loaded API zone -> compatible bay -> API ExitSpot -> pay -> leave")
+    counts = topology_counts()
+    print(
+        " Topology: "
+        f"{counts['park']} Park bays | {counts['entry']} EntrySpot | "
+        f"{counts['exit']} ExitSpot | {counts['zones']} zones | "
+        f"{counts['gates']} barriers (all discovered from API)"
+    )
+    print(" Gate roles: NOT exposed by API; no barrier is labelled entry/exit by assumption")
+    print(" Gate safety: broken/maintenance gates are never operated")
+    print(" GLOBAL LOCKDOWN: ANY broken/maintenance barrier blocks ALL new entry + exit until repaired")
+    print(" Gate interlock: car movement is released ONLY after /list-barriers confirms state=Open")
+    print(" Gate hold-open: entry/exit gate stays open until the real CarOut webhook confirms crossing")
+    print(" Zone flow: target-zone barriers come from API zoneParent and stay open until real Park CarIn")
+    print(" Anti-pile: entry gate waits briefly before returning to its startup API state")
+    print(" Payment interlock: unpaid vehicles NEVER receive goto/leavepark")
+    print(" Billing: simulator timestamps; Electric total = 2x base parking price")
+    print(" Gate topology: automatic cleanup restores first /list-barriers API state")
+    print(" Lane mapping: only physical simulator crossings are treated as confirmed")
     print("====================================================\n")
 
     app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)
