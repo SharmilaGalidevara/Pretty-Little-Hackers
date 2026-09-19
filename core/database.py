@@ -34,6 +34,8 @@ def init_db():
         exit_arrival_time TEXT,
         departure_time TEXT,
         expected_amount REAL DEFAULT 0,
+        billed_minutes INTEGER DEFAULT 0,
+        real_duration_seconds REAL DEFAULT 0,
         payment_status TEXT DEFAULT 'NONE',
         status TEXT DEFAULT 'NEW',
         decision TEXT
@@ -69,6 +71,17 @@ def init_db():
         fine_amount REAL DEFAULT 0
     );
     """)
+    
+    # Try adding new columns to an existing database
+    try:
+        conn.execute("ALTER TABLE cars ADD COLUMN billed_minutes INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE cars ADD COLUMN real_duration_seconds REAL DEFAULT 0")
+    except Exception:
+        pass
+        
     conn.commit()
     conn.close()
 

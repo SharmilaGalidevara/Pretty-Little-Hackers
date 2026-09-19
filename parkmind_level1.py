@@ -257,6 +257,10 @@ header{
       <div class="stat-icon">⚠️</div>
       <div><div class="stat-val" id="s-penalty">$–</div><div class="stat-lbl">Penalties</div></div>
     </div>
+    <div class="stat-card cyan">
+      <div class="stat-icon">👻</div>
+      <div><div class="stat-val" id="s-ghosts">–</div><div class="stat-lbl">Ghost Cars</div></div>
+    </div>
   </div>
 
   <!-- ── Left panel: spots + gates ── -->
@@ -431,6 +435,7 @@ async function refresh(){
     document.getElementById('s-cars').textContent    = d.stats.total_cars;
     document.getElementById('s-revenue').textContent = '$'+d.stats.total_revenue.toFixed(2);
     document.getElementById('s-penalty').textContent = '$'+d.stats.total_penalties.toFixed(2);
+    document.getElementById('s-ghosts').textContent  = d.stats.ghost_cars;
     document.getElementById('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
 
     // Sections
@@ -471,6 +476,9 @@ def api_status():
     revenue = conn.execute(
         "SELECT COALESCE(SUM(expected_amount),0) as t FROM cars WHERE payment_status='PAID'"
     ).fetchone()["t"] or 0
+    ghost_cars = conn.execute(
+        "SELECT count(*) as c FROM cars WHERE status IN ('PAYMENT_PENDING', 'TO_EXIT') AND parked_time < datetime('now', 'localtime', '-5 minutes')"
+    ).fetchone()["c"] or 0
     conn.close()
 
     with state.state_lock:
@@ -510,6 +518,7 @@ def api_status():
             "total_cars":      len(cars_raw),
             "total_revenue":   float(revenue),
             "total_penalties": float(get_total_penalties()),
+            "ghost_cars":      ghost_cars,
         }
     })
 

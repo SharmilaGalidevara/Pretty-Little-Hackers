@@ -152,14 +152,11 @@ def calculate_charge(plate, exit_time_str):
         game_seconds = real_seconds * GAME_SPEED_MULTIPLIER
         planned      = float(car.get("planned_minutes") or 1)
         
-        # The simulator uses exact floats (e.g. 3.01) based on a mix of 
-        # GameSpeedMultiplier and ParkingSpeedMultiplier.
-        # To avoid undercharge penalties ("charge should be 3.01"), 
-        # we calculate a safe upper bound:
-        safe_upper_bound = planned + (game_seconds / 60.0)
-        minutes = max(1, math.ceil(safe_upper_bound))
+        # The simulator expects the exact parking duration prorated per minute, rounded to 2 decimal places.
+        game_minutes = game_seconds / 60.0
+        minutes = max(1.0, round(game_minutes, 2))
     except Exception:
-        minutes = max(1, int(car.get("planned_minutes") or 1))
+        minutes = max(1.0, float(car.get("planned_minutes") or 1))
 
     parking_cost  = float(minutes) * 1.0
     charging_cost = float(minutes) * 1.0 if "electric" in str(car.get("car_type", "")).lower() else 0.0
@@ -183,3 +180,4 @@ def process_exit_queue():
                 open_gate(EXIT_GATE)
         except Exception as e:
             log_decision(plate, "ERROR", f"Exit release failed: {e}")
+

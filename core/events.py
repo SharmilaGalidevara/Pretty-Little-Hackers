@@ -131,24 +131,36 @@ def handle_event(data):
 
                 upsert_car(
                     plate, exit_arrival_time=server_time, expected_amount=expected,
+                    billed_minutes=minutes,
                     payment_status="REQUESTED", status="PAYMENT_PENDING"
                 )
                 log_decision(plate, "AT_EXIT", f"{minutes} min; total=${expected:.2f}")
-                # Delay the charge request slightly to let the car fully stop
-                threading.Timer(2.5, charge_car, args=(plate, parking_cost, charging_cost)).start()
+                # Charge the car immediately to avoid escaped without paying penalties
+                charge_car(plate, parking_cost, charging_cost)
 
             elif spot_type == "ExitSpot" and direction == "CarOut":
-                upsert_car(plate, departure_time=server_time, status="LEFT")
-                log_decision(plate, "DEPARTED", "Car left parking")
+                car = get_car(plate)
+                duration = 0
+                if car and car.get("entry_time"):
+                    try:
+                        from datetime import datetime
+                        t1 = datetime.strptime(car["entry_time"], "%Y-%m-%d %H:%M:%S")
+                        t2 = datetime.strptime(server_time, "%Y-%m-%d %H:%M:%S")
+                        duration = (t2 - t1).total_seconds()
+                    except Exception:
+                        pass
+                        
+                upsert_car(plate, departure_time=server_time, status="LEFT", real_duration_seconds=duration)
+                log_decision(plate, "DEPARTED", f"Car left parking (real_duration: {duration}s)")
 
                 with state.state_lock:
                     if state.exit_active and state.exit_active["plate"] == plate:
                         state.exit_active = None
-                        try:
-                            close_gate(EXIT_GATE)
-                        except Exception as e:
-                            log_decision(plate, "ERROR", f"Close exit gate failed: {e}")
-                        threading.Timer(1.0, process_exit_queue).start()
+                    try:
+                        close_gate(EXIT_GATE)
+                    except Exception as e:
+                        log_decision(plate, "ERROR", f"Close exit gate failed: {e}")
+                    threading.Timer(1.0, process_exit_queue).start()
 
         # ── Payment received ─────────────────────────────────────────────────
         elif event_class == "payment_made":
@@ -271,3 +283,4 @@ def handle_event(data):
     except Exception as e:
         print("[EVENT ERROR]", e)
         log_decision("", "ERROR", f"{event_class}: {e}")
+
