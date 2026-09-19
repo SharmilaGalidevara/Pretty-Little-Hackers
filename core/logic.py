@@ -3,14 +3,10 @@ import re
 import math
 import threading
 from datetime import datetime
-from core.config import ENTRY_GATE, EXIT_GATE
+from core.config import ENTRY_GATE, EXIT_GATE, GAME_SPEED_MULTIPLIER
 from core import state
-from core.database import (
-    log_decision, upsert_car, get_car
-)
-from core.simulator import (
-    open_gate, close_gate, send_car, charge_car, sync_state
-)
+from core.database import log_decision, upsert_car, get_car
+from core.simulator import open_gate, close_gate, send_car, charge_car, sync_state
 
 
 def natural_spot_key(name):
@@ -20,7 +16,7 @@ def natural_spot_key(name):
 
 def compatible(spot, car_type):
     target = str(spot.get("parkingForCarType", "Any")).lower()
-    car = str(car_type or "Normal").lower()
+    car    = str(car_type or "Normal").lower()
     if target == "any":
         return True
     if "electric" in car and target == "electric":
@@ -31,6 +27,7 @@ def compatible(spot, car_type):
 
 
 def choose_spot(car_type):
+    """Return the best available compatible spot name, or None if full."""
     candidates = []
     for name, s in state.spots.items():
         if s.get("occupied") or s.get("broken") or s.get("isUnderMaintenance"):
@@ -54,14 +51,14 @@ def process_entry_queue():
                 print("[SYNC ERROR]", e)
                 return
 
-        item = state.entry_queue.pop(0)
-        plate = item["plate"]
+        item     = state.entry_queue.pop(0)
+        plate    = item["plate"]
         car_type = item["car_type"]
-        spot = choose_spot(car_type)
+        spot     = choose_spot(car_type)
 
         if not spot:
             upsert_car(plate, status="LEFT_FULL")
-            log_decision(plate, "NO_SPACE", "No safe compatible parking spot. Sending car away.")
+            log_decision(plate, "NO_SPACE", "No safe compatible parking spot. Car turned away.")
             try:
                 send_car(plate, "leavepark")
             except Exception as e:
@@ -87,9 +84,11 @@ def process_entry_queue():
 
 
 def schedule_exit(plate, planned_minutes):
-    seconds = max(1, int(planned_minutes)) * 60
-    log_decision(plate, "TIMER", f"Exit scheduled in {seconds} seconds")
-    timer = threading.Timer(seconds, send_to_exit, args=(plate,))
+    """Schedule car to move to exit. Respects GameSpeedMultiplier."""
+    real_seconds = max(5, int(planned_minutes * 60 / max(0.1, GAME_SPEED_MULTIPLIER)))
+    log_decision(plate, "TIMER",
+                 f"Exit in {real_seconds}s (planned={planned_minutes}min, speed={GAME_SPEED_MULTIPLIER}x)")
+    timer = threading.Timer(real_seconds, send_to_exit, args=(plate,))
     timer.daemon = True
     timer.start()
 
@@ -111,16 +110,16 @@ def calculate_charge(plate, exit_time_str):
         return (1, 1.0, 0.0)
 
     parked_str = car.get("parked_time")
-    minutes = 1
+    minutes    = 1
     try:
-        parked = datetime.strptime(parked_str, "%Y-%m-%d %H:%M:%S")
+        parked    = datetime.strptime(parked_str, "%Y-%m-%d %H:%M:%S")
         exit_time = datetime.strptime(exit_time_str, "%Y-%m-%d %H:%M:%S")
-        minutes = max(1, math.ceil((exit_time - parked).total_seconds() / 60))
+        minutes   = max(1, math.ceil((exit_time - parked).total_seconds() / 60))
     except Exception:
         minutes = max(1, int(car.get("planned_minutes") or 1))
 
-    parking_cost = float(minutes)
-    charging_cost = float(minutes) if "electric" in str(car.get("car_type", "")).lower() else 0.0
+    parking_cost  = float(minutes) * 1.0
+    charging_cost = float(minutes) * 1.0 if "electric" in str(car.get("car_type", "")).lower() else 0.0
     return minutes, parking_cost, charging_cost
 
 
@@ -129,9 +128,9 @@ def process_exit_queue():
         if state.exit_active is not None or not state.exit_queue:
             return
 
-        plate = state.exit_queue.pop(0)
+        plate            = state.exit_queue.pop(0)
         state.exit_active = {"plate": plate, "sent": False}
-        gate_st = state.gates.get(EXIT_GATE, {}).get("state")
+        gate_st          = state.gates.get(EXIT_GATE, {}).get("state")
 
         try:
             if gate_st == "Open":

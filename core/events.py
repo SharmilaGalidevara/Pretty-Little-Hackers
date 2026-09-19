@@ -1,4 +1,4 @@
-# core/events.py  — webhook event handler (all event_class processing)
+# core/events.py  — webhook event handler
 import threading
 from datetime import datetime
 from urllib.parse import quote
@@ -9,7 +9,8 @@ from core.database import (
     upsert_zone, upsert_fan, log_penalty
 )
 from core.simulator import (
-    open_gate, close_gate, send_car, charge_car, sim_request
+    open_gate, close_gate, send_car, charge_car,
+    sim_request, set_zone_lights
 )
 from core.logic import (
     process_entry_queue, process_exit_queue,
@@ -17,13 +18,20 @@ from core.logic import (
 )
 
 
+def _zone_has_occupied_spots(zone_name):
+    """Check if any parking spot in a zone is occupied."""
+    return any(
+        s.get("occupied")
+        for s in state.spots.values()
+        if s.get("zoneParent") == zone_name
+    )
+
+
 def handle_event(data):
     event_class = data.get("EventClass")
 
     try:
-        # ----------------------------------------------------------------
-        # Gate opened / closed
-        # ----------------------------------------------------------------
+        # ── Gate action ──────────────────────────────────────────────────────
         if event_class == "gate_action":
             name   = data.get("Name")
             action = data.get("Action")
@@ -51,9 +59,7 @@ def handle_event(data):
                     if state.exit_active is None:
                         threading.Thread(target=process_exit_queue, daemon=True).start()
 
-        # ----------------------------------------------------------------
-        # Car moves between spots
-        # ----------------------------------------------------------------
+        # ── Car spot movement ────────────────────────────────────────────────
         elif event_class == "car_spot_action":
             plate       = data.get("CarPlateNumber")
             car_type    = data.get("CarType") or "Normal"
@@ -81,11 +87,16 @@ def handle_event(data):
                 with state.state_lock:
                     if spot_name in state.spots:
                         state.spots[spot_name]["occupied"] = (direction == "CarIn")
+                    zone = state.spots.get(spot_name, {}).get("zoneParent", "")
 
                 if direction == "CarIn":
                     state.reserved_spots.discard(spot_name)
                     upsert_car(plate, assigned_spot=spot_name, parked_time=server_time, status="PARKED")
                     log_decision(plate, "PARKED", spot_name)
+
+                    # Turn on zone lights when first car parks
+                    if zone:
+                        threading.Thread(target=set_zone_lights, args=(zone, True), daemon=True).start()
 
                     planned_minutes = get_car(plate).get("planned_minutes") or planned or 1
                     schedule_exit(plate, planned_minutes)
@@ -101,6 +112,12 @@ def handle_event(data):
 
                 elif direction == "CarOut":
                     log_decision(plate, "LEFT_SPOT", spot_name)
+                    # Turn off zone lights if zone is now empty
+                    if zone:
+                        with state.state_lock:
+                            zone_still_busy = _zone_has_occupied_spots(zone)
+                        if not zone_still_busy:
+                            threading.Thread(target=set_zone_lights, args=(zone, False), daemon=True).start()
 
             elif spot_type == "ExitSpot" and direction == "CarIn":
                 car = get_car(plate)
@@ -114,7 +131,7 @@ def handle_event(data):
                     plate, exit_arrival_time=server_time, expected_amount=expected,
                     payment_status="REQUESTED", status="PAYMENT_PENDING"
                 )
-                log_decision(plate, "AT_EXIT", f"{minutes} min; expected total={expected}")
+                log_decision(plate, "AT_EXIT", f"{minutes} min; total=${expected:.2f}")
                 charge_car(plate, parking_cost, charging_cost)
 
             elif spot_type == "ExitSpot" and direction == "CarOut":
@@ -130,9 +147,7 @@ def handle_event(data):
                             log_decision(plate, "ERROR", f"Close exit gate failed: {e}")
                         threading.Timer(1.0, process_exit_queue).start()
 
-        # ----------------------------------------------------------------
-        # Payment received
-        # ----------------------------------------------------------------
+        # ── Payment received ─────────────────────────────────────────────────
         elif event_class == "payment_made":
             plate    = data.get("CarPlateNumber")
             received = float(data.get("Amount") or 0)
@@ -144,9 +159,9 @@ def handle_event(data):
 
             expected = float(car.get("expected_amount") or 0)
 
-            if abs(received - expected) < 0.001:
+            if abs(received - expected) < 0.01:
                 upsert_car(plate, payment_status="PAID", status="PAID")
-                log_decision(plate, "PAYMENT_OK", f"Expected {expected}, received {received}")
+                log_decision(plate, "PAYMENT_OK", f"Expected ${expected:.2f}, got ${received:.2f}")
 
                 with state.state_lock:
                     if plate not in state.exit_queue and not (
@@ -158,71 +173,58 @@ def handle_event(data):
                 upsert_car(plate, payment_status="INVALID")
                 log_decision(
                     plate, "PAYMENT_REJECTED",
-                    f"Expected {expected}, received {received}. Gate remains closed."
+                    f"Expected ${expected:.2f}, got ${received:.2f}. Gate closed."
                 )
 
-        # ----------------------------------------------------------------
-        # Component broken — mark + auto-repair
-        # ----------------------------------------------------------------
+        # ── Component broken — mark + auto-repair ────────────────────────────
         elif event_class == "component_broken":
             name = data.get("Name")
             with state.state_lock:
-                if name in state.spots:
-                    state.spots[name]["broken"] = True
-                if name in state.gates:
-                    state.gates[name]["broken"] = True
-                if name in state.fans:
-                    state.fans[name]["broken"] = True
+                if name in state.spots:  state.spots[name]["broken"] = True
+                if name in state.gates:  state.gates[name]["broken"] = True
+                if name in state.fans:   state.fans[name]["broken"]  = True
             if name in state.fans:
                 upsert_fan(name, broken=True)
             log_decision("", "COMPONENT_BROKEN", str(name))
 
-            # Auto-repair
             try:
                 comp_type = data.get("ComponentType", "").lower()
                 if name in state.gates or "gate" in comp_type or "barrier" in comp_type:
                     sim_request("POST", f"/barrier-gates/{quote(name, safe='')}/repair")
-                    log_decision("", "AUTO_REPAIR", f"Gate {name} repair triggered")
+                    log_decision("", "AUTO_REPAIR", f"Gate {name} repaired")
                 elif name in state.fans or "fan" in comp_type:
                     sim_request("POST", f"/exhaust-fans/{quote(name, safe='')}/repair")
-                    log_decision("", "AUTO_REPAIR", f"Fan {name} repair triggered")
+                    log_decision("", "AUTO_REPAIR", f"Fan {name} repaired")
                 elif name in state.spots or "spot" in comp_type:
                     sim_request("POST", f"/parking-spots/{quote(name, safe='')}/repair")
-                    log_decision("", "AUTO_REPAIR", f"Spot {name} repair triggered")
+                    log_decision("", "AUTO_REPAIR", f"Spot {name} repaired")
                 else:
-                    for endpoint in [
+                    for ep in [
                         f"/barrier-gates/{quote(name, safe='')}/repair",
                         f"/exhaust-fans/{quote(name, safe='')}/repair",
                         f"/parking-spots/{quote(name, safe='')}/repair",
                     ]:
                         try:
-                            sim_request("POST", endpoint)
-                            log_decision("", "AUTO_REPAIR", f"{name} repaired via {endpoint}")
+                            sim_request("POST", ep)
+                            log_decision("", "AUTO_REPAIR", f"{name} repaired via {ep}")
                             break
                         except Exception:
                             pass
             except Exception as e:
                 log_decision("", "REPAIR_ERROR", f"{name}: {e}")
 
-        # ----------------------------------------------------------------
-        # Component fixed
-        # ----------------------------------------------------------------
+        # ── Component fixed ──────────────────────────────────────────────────
         elif event_class == "component_fixed":
             name = data.get("Name")
             with state.state_lock:
-                if name in state.spots:
-                    state.spots[name]["broken"] = False
-                if name in state.gates:
-                    state.gates[name]["broken"] = False
-                if name in state.fans:
-                    state.fans[name]["broken"] = False
+                if name in state.spots:  state.spots[name]["broken"] = False
+                if name in state.gates:  state.gates[name]["broken"] = False
+                if name in state.fans:   state.fans[name]["broken"]  = False
             if name in state.fans:
                 upsert_fan(name, broken=False)
             log_decision("", "COMPONENT_FIXED", str(name))
 
-        # ----------------------------------------------------------------
-        # CO / zone status — auto fan control
-        # ----------------------------------------------------------------
+        # ── CO / Zone status — auto fan + lighting ───────────────────────────
         elif event_class in ("zone_status", "co_alert"):
             zone_name = data.get("ZoneName") or data.get("Name")
             risk      = data.get("Risk") or data.get("CoRisk", "Safe")
@@ -238,7 +240,7 @@ def handle_event(data):
                     try:
                         sim_request("POST", f"/exhaust-fans/{quote(fan_name, safe='')}/on")
                         upsert_fan(fan_name, is_on=True)
-                        log_decision("", "FAN_ON", f"{fan_name} activated due to {risk} CO in {zone_name}")
+                        log_decision("", "FAN_ON", f"{fan_name} ON — {risk} CO in {zone_name}")
                     except Exception as e:
                         log_decision("", "FAN_ERROR", f"{fan_name}: {e}")
 
@@ -251,19 +253,17 @@ def handle_event(data):
                     try:
                         sim_request("POST", f"/exhaust-fans/{quote(fan_name, safe='')}/off")
                         upsert_fan(fan_name, is_on=False)
-                        log_decision("", "FAN_OFF", f"{fan_name} deactivated, zone {zone_name} safe")
+                        log_decision("", "FAN_OFF", f"{fan_name} OFF — {zone_name} safe")
                     except Exception as e:
                         log_decision("", "FAN_ERROR", f"{fan_name}: {e}")
 
-        # ----------------------------------------------------------------
-        # Penalty received
-        # ----------------------------------------------------------------
+        # ── Penalty received ─────────────────────────────────────────────────
         elif event_class == "penalty":
             reason = data.get("Reason", "Unknown")
             fine   = data.get("FineAmount", 0)
             plate  = data.get("CarPlateNumber", "")
             log_penalty(reason, fine, plate)
-            log_decision(plate, "PENALTY", f"{reason} | fine={fine}")
+            log_decision(plate, "PENALTY", f"{reason} | fine=${fine}")
 
     except Exception as e:
         print("[EVENT ERROR]", e)

@@ -1,4 +1,5 @@
 # core/simulator.py  — REST API client + simulator state sync
+import time
 import requests
 from urllib.parse import quote
 from core.config import SIM_BASE, SIM_USER, SIM_PASSWORD
@@ -20,38 +21,54 @@ def sim_login():
     print("[API] Logged in to simulator.")
 
 
-def sim_request(method, path, **kwargs):
+def sim_request(method, path, retries=3, **kwargs):
+    """Make an authenticated API call with auto-retry and token refresh."""
     global _token
     if not _token:
         sim_login()
 
-    headers = kwargs.pop("headers", {})
-    headers["Authorization"] = f"Bearer {_token}"
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            headers = kwargs.pop("headers", {})
+            headers["Authorization"] = f"Bearer {_token}"
 
-    r = requests.request(
-        method,
-        f"{SIM_BASE}{path}",
-        headers=headers,
-        timeout=8,
-        **kwargs
-    )
+            r = requests.request(
+                method,
+                f"{SIM_BASE}{path}",
+                headers=headers,
+                timeout=8,
+                **kwargs
+            )
 
-    if r.status_code == 401:
-        sim_login()
-        headers["Authorization"] = f"Bearer {_token}"
-        r = requests.request(
-            method,
-            f"{SIM_BASE}{path}",
-            headers=headers,
-            timeout=8,
-            **kwargs
-        )
+            if r.status_code == 401:
+                sim_login()
+                headers["Authorization"] = f"Bearer {_token}"
+                r = requests.request(
+                    method,
+                    f"{SIM_BASE}{path}",
+                    headers=headers,
+                    timeout=8,
+                    **kwargs
+                )
 
-    if r.status_code >= 400:
-        print(f"[API ERROR] {method} {path} -> {r.status_code} {r.text}")
-        r.raise_for_status()
+            if r.status_code >= 400:
+                print(f"[API ERROR] {method} {path} -> {r.status_code} {r.text}")
+                r.raise_for_status()
 
-    return r
+            return r
+
+        except requests.exceptions.ConnectionError as e:
+            last_exc = e
+            if attempt < retries - 1:
+                wait = 0.4 * (attempt + 1)
+                print(f"[API] Connection error, retry {attempt+1}/{retries} in {wait}s...")
+                time.sleep(wait)
+                kwargs = kwargs  # restore kwargs (pop already happened above)
+        except Exception as e:
+            raise e
+
+    raise last_exc
 
 
 def _detected_count(value):
@@ -68,7 +85,7 @@ def _detected_count(value):
 def sync_state():
     """Fetch latest spots, gates, fans, zones from simulator and persist."""
     with state.state_lock:
-        park_data = sim_request("GET", "/list-parking-spots").json()
+        park_data    = sim_request("GET", "/list-parking-spots").json()
         barrier_data = sim_request("GET", "/list-barriers").json()
 
         state.spots.clear()
@@ -104,8 +121,8 @@ def sync_state():
         except Exception as e:
             print(f"[SYNC] Could not load zones: {e}")
 
-    print(f"[SYNC] {len(state.spots)} spots, {len(state.gates)} gates, "
-          f"{len(state.fans)} fans, {len(state.zones)} zones.")
+    print(f"[SYNC] {len(state.spots)} spots | {len(state.gates)} gates | "
+          f"{len(state.fans)} fans | {len(state.zones)} zones.")
     log_decision("", "SYNC",
                  f"Loaded {len(state.spots)} spots, {len(state.gates)} gates, "
                  f"{len(state.fans)} fans, {len(state.zones)} zones")
@@ -142,7 +159,7 @@ def close_gate(name):
 
 def send_car(plate, destination):
     plate_path = quote(plate.replace(" ", ""), safe="")
-    dest_path = quote(destination, safe="")
+    dest_path  = quote(destination, safe="")
     sim_request("POST", f"/car/{plate_path}/goto/{dest_path}")
     log_decision(plate, "CAR_GOTO", destination)
 
@@ -152,9 +169,16 @@ def charge_car(plate, parking_cost, charging_cost):
     sim_request(
         "POST",
         f"/car/{plate_path}/charge",
-        params={
-            "parkingCost": parking_cost,
-            "chargingCost": charging_cost
-        }
+        params={"parkingCost": parking_cost, "chargingCost": charging_cost}
     )
     log_decision(plate, "CHARGE", f"parking={parking_cost}, charging={charging_cost}")
+
+
+def set_zone_lights(zone_name, on: bool):
+    """Turn zone lighting on or off."""
+    action = "on" if on else "off"
+    try:
+        sim_request("POST", f"/lights/group/{quote(zone_name, safe='')}/{action}")
+        log_decision("", f"LIGHTS_{action.upper()}", zone_name)
+    except Exception as e:
+        log_decision("", "LIGHT_ERROR", f"{zone_name} {action}: {e}")
