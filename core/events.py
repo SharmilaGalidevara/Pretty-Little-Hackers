@@ -104,11 +104,13 @@ def handle_event(data):
                     with state.state_lock:
                         if state.entry_active and state.entry_active["plate"] == plate:
                             state.entry_active = None
-                            try:
-                                close_gate(ENTRY_GATE)
-                            except Exception as e:
-                                log_decision(plate, "ERROR", f"Close entry gate failed: {e}")
-                            threading.Timer(1.0, process_entry_queue).start()
+                            gate_st = state.gates.get(ENTRY_GATE, {}).get("state")
+                            if gate_st != "Open":
+                                try:
+                                    close_gate(ENTRY_GATE)
+                                except Exception as e:
+                                    log_decision(plate, "ERROR", f"Close entry gate failed: {e}")
+                            threading.Timer(0.5, process_entry_queue).start()
 
                 elif direction == "CarOut":
                     log_decision(plate, "LEFT_SPOT", spot_name)

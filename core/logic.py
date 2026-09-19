@@ -40,6 +40,7 @@ def choose_spot(car_type):
 
 
 def process_entry_queue():
+    """Process next car from entry queue. Can be called from any thread."""
     with state.state_lock:
         if state.entry_active is not None or not state.entry_queue:
             return
@@ -58,7 +59,7 @@ def process_entry_queue():
 
         if not spot:
             upsert_car(plate, status="LEFT_FULL")
-            log_decision(plate, "NO_SPACE", "No safe compatible parking spot. Car turned away.")
+            log_decision(plate, "NO_SPACE", "No compatible spot. Car turned away.")
             try:
                 send_car(plate, "leavepark")
             except Exception as e:
@@ -75,12 +76,27 @@ def process_entry_queue():
         gate_st = state.gates.get(ENTRY_GATE, {}).get("state")
         try:
             if gate_st == "Open":
+                # Gate is already open — send car directly and clear active
+                # so the next car can be processed without waiting for gate close
                 state.entry_active["sent"] = True
                 send_car(plate, spot)
+                # Schedule next car after a short delay to avoid overwhelming the sim
+                threading.Timer(1.5, _clear_entry_active_and_continue, args=(plate,)).start()
             else:
                 open_gate(ENTRY_GATE)
         except Exception as e:
             log_decision(plate, "ERROR", f"Entry handling failed: {e}")
+            state.entry_active = None
+            state.reserved_spots.discard(spot)
+
+
+def _clear_entry_active_and_continue(plate):
+    """Called after car is sent when gate is permanently open."""
+    with state.state_lock:
+        if state.entry_active and state.entry_active["plate"] == plate:
+            state.entry_active = None
+    process_entry_queue()
+
 
 
 def schedule_exit(plate, planned_minutes):
