@@ -72,7 +72,7 @@ def handle_event(data):
             if spot_type == "EntrySpot" and direction == "CarIn":
                 upsert_car(
                     plate, car_type=car_type, planned_minutes=planned,
-                    entry_time=server_time, status="WAITING"
+                    entry_time=server_time, status="WAITING", payment_status=None
                 )
                 log_decision(plate, "ARRIVAL", f"Arrived at {spot_name}; planned {planned} min")
 
