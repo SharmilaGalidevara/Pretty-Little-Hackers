@@ -1,6 +1,7 @@
 # =====================================================================
 #  PARKMIND v2.0  —  "The Wow Factor" Edition
 #  Team: Pretty Little Hackers  |  Level: 1
+#  Team members: Sharmila, Jushita, Pravir, Ram
 # =====================================================================
 #  INNOVATIONS (pitch-worthy "wow" factors):
 #
