@@ -24,8 +24,10 @@ app = Flask(__name__)
 app.secret_key = "pretty-little-hackers-level1"
 
 token = None
-spots = {}
-gates = {}
+spots = {}   # name -> spot dict
+gates = {}   # name -> gate dict
+fans = {}    # name -> fan dict  (write-through cached)
+zones = {}   # name -> {co_risk, ...} (write-through cached)
 reserved_spots = set()
 
 entry_queue = []
@@ -77,6 +79,28 @@ def init_db():
         plate TEXT,
         action TEXT,
         detail TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS zones (
+        name TEXT PRIMARY KEY,
+        co_risk TEXT DEFAULT 'Safe',
+        updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS fans (
+        name TEXT PRIMARY KEY,
+        zone_parent TEXT,
+        is_on INTEGER DEFAULT 0,
+        broken INTEGER DEFAULT 0,
+        updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS penalties (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        received_at TEXT,
+        plate TEXT,
+        reason TEXT,
+        fine_amount REAL DEFAULT 0
     );
     """)
     conn.commit()
@@ -131,6 +155,76 @@ def get_car(plate):
     row = conn.execute("SELECT * FROM cars WHERE plate=?", (plate,)).fetchone()
     conn.close()
     return dict(row) if row else None
+
+def upsert_zone(name, co_risk):
+    """Persist CO zone risk level to DB and update in-memory cache."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = db()
+    conn.execute(
+        "INSERT INTO zones(name, co_risk, updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(name) DO UPDATE SET co_risk=excluded.co_risk, updated_at=excluded.updated_at",
+        (name, co_risk, now)
+    )
+    conn.commit()
+    conn.close()
+    with state_lock:
+        if name not in zones:
+            zones[name] = {}
+        zones[name]["co_risk"] = co_risk
+        zones[name]["updated_at"] = now
+
+def upsert_fan(name, zone_parent=None, is_on=None, broken=None):
+    """Persist fan state to DB and update in-memory cache."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = db()
+    # Ensure row exists
+    conn.execute(
+        "INSERT OR IGNORE INTO fans(name, zone_parent, updated_at) VALUES(?,?,?)",
+        (name, zone_parent or "", now)
+    )
+    updates = {"updated_at": now}
+    if zone_parent is not None:
+        updates["zone_parent"] = zone_parent
+    if is_on is not None:
+        updates["is_on"] = 1 if is_on else 0
+    if broken is not None:
+        updates["broken"] = 1 if broken else 0
+    cols = ", ".join(f"{k}=?" for k in updates)
+    vals = list(updates.values()) + [name]
+    conn.execute(f"UPDATE fans SET {cols} WHERE name=?", vals)
+    conn.commit()
+    conn.close()
+    with state_lock:
+        if name not in fans:
+            fans[name] = {"name": name}
+        if zone_parent is not None:
+            fans[name]["zone_parent"] = zone_parent
+        if is_on is not None:
+            fans[name]["is_on"] = is_on
+        if broken is not None:
+            fans[name]["broken"] = broken
+
+def log_penalty(reason, fine_amount, plate=""):
+    """Persist penalty to DB for tracking score."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = db()
+    conn.execute(
+        "INSERT INTO penalties(received_at, plate, reason, fine_amount) VALUES(?,?,?,?)",
+        (now, plate or "", reason or "", float(fine_amount or 0))
+    )
+    conn.commit()
+    conn.close()
+    print(f"[PENALTY] {reason} | fine={fine_amount} | plate={plate}")
+
+def load_state_from_db():
+    """On startup: reload zones and fans from DB into in-memory dicts."""
+    conn = db()
+    for row in conn.execute("SELECT * FROM zones").fetchall():
+        zones[row["name"]] = dict(row)
+    for row in conn.execute("SELECT * FROM fans").fetchall():
+        fans[row["name"]] = dict(row)
+    conn.close()
+    print(f"[DB] Loaded {len(zones)} zones, {len(fans)} fans from DB.")
 
 # -----------------------------
 # SIMULATOR REST API
@@ -206,8 +300,29 @@ def sync_state():
         for g in barrier_data:
             gates[g["name"]] = dict(g)
 
-    print(f"[SYNC] {len(spots)} parking spots, {len(gates)} gates.")
-    log_decision("", "SYNC", f"Loaded {len(spots)} spots and {len(gates)} gates")
+        # Sync fans from simulator
+        try:
+            fan_data = sim_request("GET", "/list-exhaust-fans").json()
+            for f in fan_data:
+                upsert_fan(
+                    f["name"],
+                    zone_parent=f.get("zoneParent", ""),
+                    is_on=f.get("isOn", False),
+                    broken=f.get("broken", False)
+                )
+        except Exception as e:
+            print(f"[SYNC] Could not load fans: {e}")
+
+        # Sync zones from simulator
+        try:
+            zone_data = sim_request("GET", "/list-zones").json()
+            for z in zone_data:
+                upsert_zone(z["name"], z.get("risk", "Safe"))
+        except Exception as e:
+            print(f"[SYNC] Could not load zones: {e}")
+
+    print(f"[SYNC] {len(spots)} spots, {len(gates)} gates, {len(fans)} fans, {len(zones)} zones.")
+    log_decision("", "SYNC", f"Loaded {len(spots)} spots, {len(gates)} gates, {len(fans)} fans, {len(zones)} zones")
 
 def gate_safe(name):
     g = gates.get(name)
@@ -520,7 +635,39 @@ def handle_event(data):
                     spots[name]["broken"] = True
                 if name in gates:
                     gates[name]["broken"] = True
+                if name in fans:
+                    fans[name]["broken"] = True
+            # Persist to DB
+            if name in fans:
+                upsert_fan(name, broken=True)
             log_decision("", "COMPONENT_BROKEN", str(name))
+            # Auto-repair immediately
+            try:
+                comp_type = data.get("ComponentType", "").lower()
+                if name in gates or "gate" in comp_type or "barrier" in comp_type:
+                    sim_request("POST", f"/barrier-gates/{quote(name, safe='')}/repair")
+                    log_decision("", "AUTO_REPAIR", f"Gate {name} repair triggered")
+                elif name in fans or "fan" in comp_type:
+                    sim_request("POST", f"/exhaust-fans/{quote(name, safe='')}/repair")
+                    log_decision("", "AUTO_REPAIR", f"Fan {name} repair triggered")
+                elif name in spots or "spot" in comp_type:
+                    sim_request("POST", f"/parking-spots/{quote(name, safe='')}/repair")
+                    log_decision("", "AUTO_REPAIR", f"Spot {name} repair triggered")
+                else:
+                    # Try all repair endpoints
+                    for endpoint in [
+                        f"/barrier-gates/{quote(name, safe='')}/repair",
+                        f"/exhaust-fans/{quote(name, safe='')}/repair",
+                        f"/parking-spots/{quote(name, safe='')}/repair",
+                    ]:
+                        try:
+                            sim_request("POST", endpoint)
+                            log_decision("", "AUTO_REPAIR", f"{name} repaired via {endpoint}")
+                            break
+                        except Exception:
+                            pass
+            except Exception as e:
+                log_decision("", "REPAIR_ERROR", f"{name}: {e}")
 
         elif event_class == "component_fixed":
             name = data.get("Name")
@@ -529,10 +676,52 @@ def handle_event(data):
                     spots[name]["broken"] = False
                 if name in gates:
                     gates[name]["broken"] = False
+                if name in fans:
+                    fans[name]["broken"] = False
+            if name in fans:
+                upsert_fan(name, broken=False)
             log_decision("", "COMPONENT_FIXED", str(name))
 
+        elif event_class in ("zone_status", "co_alert"):
+            # CO gas monitoring — auto-control fans
+            zone_name = data.get("ZoneName") or data.get("Name")
+            risk = data.get("Risk") or data.get("CoRisk", "Safe")
+            if zone_name:
+                upsert_zone(zone_name, risk)
+                log_decision("", "ZONE_CO", f"{zone_name} -> {risk}")
+
+            if risk in ("High", "Moderate"):
+                # Turn on all fans in this zone
+                with state_lock:
+                    zone_fans = [name for name, f in fans.items()
+                                 if f.get("zone_parent") == zone_name and not f.get("broken")]
+                for fan_name in zone_fans:
+                    try:
+                        sim_request("POST", f"/exhaust-fans/{quote(fan_name, safe='')}/on")
+                        upsert_fan(fan_name, is_on=True)
+                        log_decision("", "FAN_ON", f"{fan_name} activated due to {risk} CO in {zone_name}")
+                    except Exception as e:
+                        log_decision("", "FAN_ERROR", f"{fan_name}: {e}")
+            elif risk == "Safe":
+                # Turn off fans when safe
+                with state_lock:
+                    zone_fans = [name for name, f in fans.items()
+                                 if f.get("zone_parent") == zone_name
+                                 and f.get("is_on") and not f.get("broken")]
+                for fan_name in zone_fans:
+                    try:
+                        sim_request("POST", f"/exhaust-fans/{quote(fan_name, safe='')}/off")
+                        upsert_fan(fan_name, is_on=False)
+                        log_decision("", "FAN_OFF", f"{fan_name} deactivated, zone {zone_name} safe")
+                    except Exception as e:
+                        log_decision("", "FAN_ERROR", f"{fan_name}: {e}")
+
         elif event_class == "penalty":
-            log_decision("", "PENALTY", f"{data.get('Reason')} | fine={data.get('FineAmount')}")
+            reason = data.get("Reason", "Unknown")
+            fine = data.get("FineAmount", 0)
+            plate = data.get("CarPlateNumber", "")
+            log_penalty(reason, fine, plate)
+            log_decision(plate, "PENALTY", f"{reason} | fine={fine}")
 
     except Exception as e:
         print("[EVENT ERROR]", e)
@@ -730,6 +919,7 @@ def manual_exit(plate):
 
 if __name__ == "__main__":
     init_db()
+    load_state_from_db()  # Restore zones/fans from DB on startup
 
     try:
         sim_login()
