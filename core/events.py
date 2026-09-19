@@ -134,7 +134,8 @@ def handle_event(data):
                     payment_status="REQUESTED", status="PAYMENT_PENDING"
                 )
                 log_decision(plate, "AT_EXIT", f"{minutes} min; total=${expected:.2f}")
-                charge_car(plate, parking_cost, charging_cost)
+                # Delay the charge request slightly to let the car fully stop
+                threading.Timer(2.5, charge_car, args=(plate, parking_cost, charging_cost)).start()
 
             elif spot_type == "ExitSpot" and direction == "CarOut":
                 upsert_car(plate, departure_time=server_time, status="LEFT")

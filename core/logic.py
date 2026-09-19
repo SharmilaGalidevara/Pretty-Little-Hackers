@@ -29,14 +29,31 @@ def compatible(spot, car_type):
 def choose_spot(car_type):
     """Return the best available compatible spot name, or None if full."""
     candidates = []
+    target_car = str(car_type or "Normal").lower()
+    
     for name, s in state.spots.items():
         if s.get("occupied") or s.get("broken") or s.get("isUnderMaintenance"):
             continue
         if name in state.reserved_spots or not compatible(s, car_type):
             continue
-        candidates.append(name)
-    candidates.sort(key=natural_spot_key)
-    return candidates[0] if candidates else None
+        candidates.append((name, s))
+        
+    if not candidates:
+        return None
+
+    # Sort logic: 
+    # 1. Exact match (e.g., Electric car -> Electric spot) preferred over 'Any'
+    # 2. Then by natural spot key (closest spot)
+    def sort_key(item):
+        name, s = item
+        spot_type = str(s.get("parkingForCarType", "Any")).lower()
+        exact_match = (spot_type == target_car) and (spot_type != "any")
+        
+        # We want exact_match=True to sort before exact_match=False
+        return (not exact_match, natural_spot_key(name))
+
+    candidates.sort(key=sort_key)
+    return candidates[0][0]
 
 
 def process_entry_queue():
@@ -130,7 +147,17 @@ def calculate_charge(plate, exit_time_str):
     try:
         parked    = datetime.strptime(parked_str, "%Y-%m-%d %H:%M:%S")
         exit_time = datetime.strptime(exit_time_str, "%Y-%m-%d %H:%M:%S")
-        minutes   = max(1, math.ceil((exit_time - parked).total_seconds() / 60))
+        
+        real_seconds = (exit_time - parked).total_seconds()
+        game_seconds = real_seconds * GAME_SPEED_MULTIPLIER
+        planned      = float(car.get("planned_minutes") or 1)
+        
+        # The simulator uses exact floats (e.g. 3.01) based on a mix of 
+        # GameSpeedMultiplier and ParkingSpeedMultiplier.
+        # To avoid undercharge penalties ("charge should be 3.01"), 
+        # we calculate a safe upper bound:
+        safe_upper_bound = planned + (game_seconds / 60.0)
+        minutes = max(1, math.ceil(safe_upper_bound))
     except Exception:
         minutes = max(1, int(car.get("planned_minutes") or 1))
 
