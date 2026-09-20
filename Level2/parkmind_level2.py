@@ -1,5 +1,5 @@
 # =====================================================================
-#  PARKMIND v2.8  —  LEVEL 2 API-DRIVEN "Race-Safe Exit" Edition
+#  PARKMIND v2.9  —  LEVEL 2 API-DRIVEN "Entry-Spawn Safe" Edition
 #  Team: Pretty Little Hackers  |  Level: 2 — API-Driven
 #  Team members: Sharmila, Jushita, Pravir, Ram
 # =====================================================================
@@ -67,6 +67,19 @@ SIM_PASSWORD = os.getenv("PARKMIND_SIM_PASSWORD", "admin")
 ENTRY_GATE = None
 EXIT_GATE = None
 GATE_AUTO_DISCOVERY = True
+
+# CRITICAL SPAWN-ROUTE SAFETY INVARIANT.
+# The simulator attempts to create new arrivals BEFORE PARKMIND receives an
+# EntrySpot webhook. If the entrance perimeter barrier is closed at that moment,
+# the simulator cannot even create the vehicle and reports:
+#     [ERROR] Won't spawn car No path from A to P2
+# Therefore the API-discovered ENTRY_GATE is NEVER automatically or manually
+# closed while PARKMIND is running. This is intentionally stronger than the old
+# best-effort keep-open policy: every generic idle/exit cleanup path is prevented
+# from closing the spawn-critical gate. The EXIT barrier remains independently
+# controllable for the payment interlock.
+KEEP_ENTRY_GATE_OPEN = True
+KEEP_OPEN_GATES_ENV = [g.strip() for g in os.getenv("PARKMIND_KEEP_OPEN_GATES", "").split(",") if g.strip()]
 
 # Level-2 policy settings. These are controller policies, not simulator data.
 DAY_START_HOUR = int(os.getenv("PARKMIND_DAY_START_HOUR", "6"))
@@ -146,7 +159,7 @@ zone_gates = defaultdict(list)
 
 # Local operator intent is not simulator state. AUTO means PARKMIND policies may
 # control that component; ON/OFF means the operator explicitly overrode it.
-manual_overrides = {"fan": {}, "light": {}, "light_group": {}}
+manual_overrides = {"gate": {}, "fan": {}, "light": {}, "light_group": {}}
 maintenance_requested = set()
 last_simulator_time = None
 last_simulator_time_seen_at = None  # local monotonic time when webhook clock was received
@@ -1603,7 +1616,23 @@ def gate_safe(name):
     return not g.get("broken", False) and not g.get("isUnderMaintenance", False)
 
 
-def open_gate(name):
+def gate_manual_override(name):
+    """Return True=hold OPEN, False=hold CLOSED, None=AUTO."""
+    with state_lock:
+        return manual_overrides.get("gate", {}).get(name)
+
+
+def open_gate(name, manual=False):
+    # A dashboard CLOSE override is persistent: automation may not reopen it.
+    # Explicit dashboard/manual commands pass manual=True and may change it.
+    override = gate_manual_override(name)
+    if override is False and not manual:
+        log_decision(
+            "", "GATE_OPEN_BLOCKED_BY_OVERRIDE", name,
+            "Operator selected MANUAL CLOSED; automatic open command suppressed until AUTO or OPEN is selected."
+        )
+        return False
+
     if not gate_safe(name):
         log_decision("", "BLOCKED", f"Refused to open {name}: broken/maintenance",
                      "Gate safety check failed.")
@@ -1617,7 +1646,31 @@ def open_gate(name):
     return True
 
 
-def close_gate(name):
+def close_gate(name, force=False, manual=False):
+    # HARD INVARIANT: the API-discovered entrance barrier is part of the
+    # simulator's A -> EntrySpot spawn path. Closing it prevents the simulator
+    # from creating the next vehicle, so it cannot be manually or automatically
+    # held closed during a live run.
+    if ENTRY_GATE and name == ENTRY_GATE:
+        log_decision(
+            "", "ENTRY_GATE_CLOSE_BLOCKED", name,
+            "Spawn-route safety invariant: entrance barrier must remain open so A -> EntrySpot always has a path."
+        )
+        return False
+
+    # A dashboard OPEN override is persistent. Even force=True is only for
+    # bypassing normal keep-open policy; it must NOT bypass an operator override.
+    override = gate_manual_override(name)
+    if override is True and not manual:
+        log_decision(
+            "", "GATE_CLOSE_BLOCKED_BY_OVERRIDE", name,
+            "Operator selected MANUAL OPEN; automatic close command suppressed until AUTO or CLOSE is selected."
+        )
+        return False
+
+    # Other configured keep-open barriers are protected from automatic cleanup.
+    if not force and name in keep_open_gate_names():
+        return False
     if not gate_safe(name):
         log_decision("", "BLOCKED", f"Refused to close {name}: broken/maintenance",
                      "Gate safety check failed.")
@@ -1629,6 +1682,43 @@ def close_gate(name):
     log_decision("", "GATE_CLOSE_CMD", name,
                  "Command sent through authenticated simulator API; webhook remains authoritative.")
     return True
+
+
+manual_gate_closed = set()      # keep-open gates an operator closed on purpose
+_keep_open_last_try = {}        # name -> monotonic time of the last auto-open attempt
+
+
+def keep_open_gate_names():
+    """Barriers that stay open while idle. The discovered entry gate is mandatory."""
+    names = {n for n in KEEP_OPEN_GATES_ENV if n in gates}
+    if ENTRY_GATE and ENTRY_GATE in gates:
+        names.add(ENTRY_GATE)
+    return names
+
+
+def ensure_keep_open_gates():
+    """Open keep-open barriers that are not already Open/Opening (debounced)."""
+    for name in keep_open_gate_names():
+        # ENTRY_GATE can never be held closed because of the spawn-route invariant.
+        # Other keep-open gates may be deliberately held CLOSED by an operator.
+        if ((name in manual_gate_closed or gate_manual_override(name) is False)
+                and name != ENTRY_GATE):
+            continue
+        if not gate_safe(name):
+            continue
+        state = str(gates.get(name, {}).get("state") or "")
+        if state in ("Open", "Opening"):
+            continue
+        now = time.monotonic()
+        if now - _keep_open_last_try.get(name, 0.0) < 3.0:
+            continue
+        _keep_open_last_try[name] = now
+        try:
+            open_gate(name)
+            log_decision("", "KEEP_OPEN", name,
+                         "Entry-side barrier held open while idle so arriving cars always have a route.")
+        except Exception as e:
+            log_decision("", "KEEP_OPEN_ERROR", f"{name}: {e}")
 
 
 def mark_entry_dispatched(plate, spot):
@@ -1658,10 +1748,14 @@ def close_idle_gates():
                     and exit_active is None and exit_lane_plate is None and not physical_exit_queue
                 )
                 candidates = list(gates.keys())
+            keep_open = keep_open_gate_names()
             if movement_idle:
                 for name in candidates:
+                    if name in keep_open:
+                        continue
                     if str(gates.get(name, {}).get("state") or "") in ("Open", "Opening"):
                         close_gate(name)
+            ensure_keep_open_gates()
         except Exception as e:
             print("[IDLE GATE WATCHDOG]", e)
 
@@ -1757,16 +1851,18 @@ def zone_crossing_busy(zone_name, excluding_plate=None):
 
 
 def close_entry_if_idle():
-    """Close discovered perimeter barriers only when the entry pipeline is idle."""
+    """Close only NON-entry perimeter barriers when the entry pipeline is idle."""
     with state_lock:
         if entry_active is not None or entry_queue:
             return
-        names = list(perimeter_gates)
+        names = [name for name in perimeter_gates if name != ENTRY_GATE]
     for name in names:
         try:
             close_gate(name)
         except Exception as e:
             log_decision("", "ENTRY_IDLE_CLOSE_ERROR", f"{name}: {e}")
+    # Reassert the spawn-route invariant after any perimeter cleanup.
+    ensure_keep_open_gates()
 
 
 def send_car(plate, destination):
@@ -3030,12 +3126,14 @@ def close_exit_if_idle():
         if (physical_exit_queue or exit_active is not None or
                 exit_lane_plate is not None or escape_corridor_plate is not None):
             return
-        names = list(perimeter_gates)
+        # Never include the spawn-critical entrance barrier in exit cleanup.
+        names = [name for name in perimeter_gates if name != ENTRY_GATE]
     for name in names:
         try:
             close_gate(name)
         except Exception:
             pass
+    ensure_keep_open_gates()
 
 
 # =====================================================================
@@ -4013,6 +4111,1464 @@ button{border:0;background:#0284c7;color:#fff;font-weight:700;cursor:pointer}
 """
 
 
+ADMIN_DASH_HTML = r'''
+
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<title>PARKMIND — Admin Command Centre</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+
+*{
+    box-sizing:border-box;
+}
+
+body{
+    margin:0;
+    background:
+        radial-gradient(circle at top right,#102a43 0,#07111f 38%,#050b14 100%);
+    color:#e5e7eb;
+    font-family:'Segoe UI',Arial,sans-serif;
+}
+
+header{
+    min-height:70px;
+    padding:12px 24px;
+    background:rgba(9,20,35,.95);
+    border-bottom:1px solid #26364e;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:20px;
+    position:sticky;
+    top:0;
+    z-index:20;
+    backdrop-filter:blur(12px);
+}
+
+.brand{
+    font-size:23px;
+    font-weight:900;
+    color:#67e8f9;
+    letter-spacing:.5px;
+}
+
+.subtitle{
+    font-size:10px;
+    color:#94a3b8;
+    margin-top:3px;
+}
+
+a{
+    color:#67e8f9;
+    text-decoration:none;
+}
+
+.nav{
+    display:flex;
+    gap:7px;
+    align-items:center;
+    flex-wrap:wrap;
+}
+
+.nav a,
+.nav button{
+    background:#0f2238;
+    border:1px solid #29425e;
+    color:#ccefff;
+    padding:7px 10px;
+    border-radius:8px;
+    font-size:11px;
+    cursor:pointer;
+}
+
+.nav a:hover,
+.nav button:hover{
+    background:#123452;
+}
+
+.page{
+    max-width:1550px;
+    margin:auto;
+    padding:18px;
+}
+
+.live{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    background:linear-gradient(90deg,#082438,#0c1c30);
+    border:1px solid #1c5571;
+    padding:10px 14px;
+    border-radius:12px;
+    margin-bottom:12px;
+}
+
+.live-dot{
+    display:inline-block;
+    width:9px;
+    height:9px;
+    background:#4ade80;
+    border-radius:50%;
+    margin-right:7px;
+    box-shadow:0 0 12px #4ade80;
+}
+
+.kpis{
+    display:grid;
+    grid-template-columns:repeat(7,1fr);
+    gap:9px;
+    margin-bottom:12px;
+}
+
+.kpi{
+    background:linear-gradient(145deg,#101d31,#0d1828);
+    border:1px solid #26364e;
+    border-radius:14px;
+    padding:13px;
+    min-height:90px;
+}
+
+.kpi:hover{
+    transform:translateY(-2px);
+    border-color:#2d6684;
+    transition:.2s;
+}
+
+.kpi .v{
+    font-size:24px;
+    font-weight:900;
+    margin-bottom:5px;
+}
+
+.kpi .k{
+    font-size:9px;
+    color:#94a3b8;
+    text-transform:uppercase;
+    letter-spacing:.5px;
+}
+
+.good{color:#86efac}
+.cyan{color:#67e8f9}
+.warn{color:#fbbf24}
+.bad{color:#f87171}
+.purple{color:#c4b5fd}
+
+.grid{
+    display:grid;
+    grid-template-columns:1.45fr .55fr;
+    gap:12px;
+}
+
+.two{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:12px;
+    margin-top:12px;
+}
+
+.card{
+    background:rgba(16,27,45,.92);
+    border:1px solid #26364e;
+    border-radius:15px;
+    padding:15px;
+    box-shadow:0 10px 30px rgba(0,0,0,.15);
+}
+
+.card h2{
+    margin:0 0 12px;
+    font-size:13px;
+    text-transform:uppercase;
+    color:#dbeafe;
+    letter-spacing:.5px;
+}
+
+.card-head{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:10px;
+}
+
+.mini{
+    font-size:10px;
+    color:#94a3b8;
+}
+
+.chart-box{
+    height:270px;
+    position:relative;
+}
+
+.chart-box.small{
+    height:220px;
+}
+
+canvas{
+    max-width:100%;
+}
+
+table{
+    width:100%;
+    border-collapse:collapse;
+    font-size:11px;
+}
+
+th,td{
+    padding:8px;
+    border-bottom:1px solid #26364e;
+    text-align:left;
+}
+
+th{
+    font-size:9px;
+    color:#94a3b8;
+    text-transform:uppercase;
+}
+
+.badge{
+    padding:3px 7px;
+    border-radius:999px;
+    background:#17263a;
+    font-size:9px;
+}
+
+.section-title{
+    margin:20px 0 10px;
+    font-size:12px;
+    color:#94a3b8;
+    text-transform:uppercase;
+    letter-spacing:1px;
+}
+
+.metric-row{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:9px;
+}
+
+.metric{
+    padding:11px;
+    border:1px solid #253a54;
+    border-radius:10px;
+    background:#0c1727;
+}
+
+.metric strong{
+    display:block;
+    font-size:18px;
+    margin-top:4px;
+}
+
+button{
+    border:0;
+    background:#0284c7;
+    color:white;
+    cursor:pointer;
+    padding:7px 10px;
+    border-radius:7px;
+}
+
+button:hover{
+    background:#0369a1;
+}
+
+.action-btn{
+    padding:9px 13px;
+    border-radius:9px;
+    background:#075985;
+    border:1px solid #0e7490;
+    color:white;
+    cursor:pointer;
+    font-weight:700;
+}
+
+.action-btn:hover{
+    background:#0e7490;
+}
+
+.alert-box{
+    padding:11px;
+    border-radius:10px;
+    margin-bottom:8px;
+    background:#171b27;
+    border:1px solid #30384a;
+}
+
+.alert-box.critical{
+    border-left:4px solid #f87171;
+}
+
+.alert-box.warning{
+    border-left:4px solid #fbbf24;
+}
+
+.maintenance-highlight{
+    border:1px solid #735d18;
+    background:linear-gradient(135deg,#241e0b,#16150d);
+}
+
+.progress{
+    height:7px;
+    background:#1e293b;
+    border-radius:99px;
+    overflow:hidden;
+    margin-top:7px;
+}
+
+.progress span{
+    display:block;
+    height:100%;
+    background:#fbbf24;
+}
+
+.footer-note{
+    text-align:center;
+    color:#64748b;
+    font-size:9px;
+    margin:25px 0 10px;
+}
+
+@media(max-width:1200px){
+    .kpis{
+        grid-template-columns:repeat(4,1fr);
+    }
+}
+
+@media(max-width:900px){
+    .kpis,
+    .grid,
+    .two{
+        grid-template-columns:1fr 1fr;
+    }
+}
+
+@media(max-width:600px){
+    .kpis,
+    .grid,
+    .two{
+        grid-template-columns:1fr;
+    }
+
+    header{
+        position:static;
+        flex-direction:column;
+        align-items:flex-start;
+    }
+}
+
+
+/* ============================================================
+   EXISTING PARKMIND LIVE CONTROLS — ADMIN ONLY
+   ============================================================ */
+.control-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+.control-list{display:flex;flex-direction:column;gap:7px}
+.control-row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid #26364e}
+.control-row:last-child{border-bottom:0}
+.control-actions{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+.control-actions form{display:inline}
+.btn-green{background:#047857}.btn-red{background:#b91c1c}.btn-gray{background:#475569}.btn-yellow{background:#a16207}
+.btn-green:hover{background:#059669}.btn-red:hover{background:#dc2626}.btn-gray:hover{background:#64748b}.btn-yellow:hover{background:#ca8a04}
+.override-open{color:#86efac}.override-closed{color:#fca5a5}.override-auto{color:#94a3b8}
+.live-table-wrap{max-height:330px;overflow:auto}
+.alert-row{padding:10px;border-radius:9px;background:#281116;border:1px solid #7f1d1d;margin-bottom:7px;font-size:10px;line-height:1.5}
+.alert-row.high{background:#2a210d;border-color:#92400e}
+.admin-tool-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.zone-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:8px}
+.zone-box{padding:10px;border:1px solid #253a54;border-radius:10px;background:#0c1727}
+.zone-bar{height:6px;background:#1e293b;border-radius:99px;overflow:hidden;margin-top:7px}.zone-bar span{display:block;height:100%;background:#38bdf8}
+@media(max-width:900px){.control-grid{grid-template-columns:1fr}}
+
+</style>
+</head>
+
+<body>
+
+<header>
+
+<div>
+    <div class="brand">PARKMIND · ADMIN COMMAND CENTRE</div>
+    <div class="subtitle">
+        Business intelligence · Parking operations · Maintenance · Security
+    </div>
+</div>
+
+<div class="nav">
+    <span class="mini">{{sim_time or 'Simulator time unavailable'}}</span>
+    <a href="#live-control">Live Controls</a>
+    <a href="/maintenance/">Maintenance</a>
+    <a href="#critical-alerts">Alerts</a>
+    <a href="/export/cars">Export</a>
+    <a href="/search">Search / Audit</a>
+    <a href="/logout">Logout</a>
+</div>
+
+</header>
+
+
+<div class="page">
+
+<div class="live">
+    <div>
+        <span class="live-dot"></span>
+        <b>LIVE SIMULATOR MONITORING</b>
+        <span class="mini"> · Dashboard refreshes every 10 seconds</span>
+    </div>
+
+    <div class="mini">
+        Simulator date: <b>{{today_date or 'Waiting...'}}</b>
+    </div>
+</div>
+
+
+<!-- =====================================================
+     KPI STRIP
+====================================================== -->
+
+<div class="kpis">
+
+<div class="kpi">
+    <div class="v good">{{'%.2f'|format(today.revenue)}}</div>
+    <div class="k">Revenue Today</div>
+</div>
+
+<div class="kpi">
+    <div class="v cyan">{{today.paid_cars}}</div>
+    <div class="k">Paid Cars</div>
+</div>
+
+<div class="kpi">
+    <div class="v warn">{{'%.2f'|format(today.avg_ticket)}}</div>
+    <div class="k">Average Ticket</div>
+</div>
+
+<div class="kpi">
+    <div class="v {{'good' if delta is not none and delta>=0 else 'bad'}}">
+        {{delta_text}}
+    </div>
+    <div class="k">vs Yesterday</div>
+</div>
+
+<div class="kpi">
+    <div class="v bad">
+        {{'%.2f'|format(maintenance.today_cost)}}
+    </div>
+    <div class="k">Maintenance Cost</div>
+</div>
+
+<div class="kpi">
+    <div class="v good">
+        {{'%.2f'|format(maintenance.revenue_after_maintenance)}}
+    </div>
+    <div class="k">Revenue After Maintenance</div>
+</div>
+
+<div class="kpi">
+    <div class="v {{'bad' if overview.alerts else 'good'}}">
+        {{overview.alerts}}
+    </div>
+    <div class="k">Critical Alerts</div>
+</div>
+
+</div>
+
+
+<!-- =====================================================
+     REVENUE ANALYTICS
+====================================================== -->
+
+<div class="section-title">Revenue Intelligence</div>
+
+<div class="grid">
+
+<div class="card">
+
+<div class="card-head">
+    <h2>7-Day Revenue Trend</h2>
+    <span class="badge">SIMULATOR DATA</span>
+</div>
+
+<div class="chart-box">
+    <canvas id="revenueChart"></canvas>
+</div>
+
+</div>
+
+
+<div class="card">
+
+<h2>Today's Revenue Mix</h2>
+
+<div class="chart-box">
+    <canvas id="mixChart"></canvas>
+</div>
+
+<div class="metric-row">
+
+<div class="metric">
+    <span class="mini">Parking</span>
+    <strong class="cyan">
+        {{'%.2f'|format(mix.parking)}}
+    </strong>
+</div>
+
+<div class="metric">
+    <span class="mini">Charging</span>
+    <strong class="purple">
+        {{'%.2f'|format(mix.charging)}}
+    </strong>
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+
+<div class="two">
+
+<div class="card">
+
+<h2>Hourly Revenue</h2>
+
+<div class="chart-box small">
+    <canvas id="hourlyChart"></canvas>
+</div>
+
+</div>
+
+
+<div class="card">
+
+<h2>Today vs Yesterday</h2>
+
+<div class="chart-box small">
+    <canvas id="comparisonChart"></canvas>
+</div>
+
+</div>
+
+</div>
+
+
+<!-- =====================================================
+     OPERATIONS
+====================================================== -->
+
+<div class="section-title">Parking Operations</div>
+
+<div class="two">
+
+<div class="card">
+
+<div class="card-head">
+    <h2>Parking Operations</h2>
+    <a href="#live-control" class="action-btn">
+        Open Live Controls →
+    </a>
+</div>
+
+<div class="metric-row">
+
+<div class="metric">
+    <span class="mini">Arrivals Today</span>
+    <strong class="cyan">{{operations.arrivals}}</strong>
+</div>
+
+<div class="metric">
+    <span class="mini">Departures Today</span>
+    <strong class="good">{{operations.departures}}</strong>
+</div>
+
+<div class="metric">
+    <span class="mini">Penalties</span>
+    <strong class="bad">{{operations.penalties}}</strong>
+</div>
+
+<div class="metric">
+    <span class="mini">CO Incidents</span>
+    <strong class="warn">{{operations.co_incidents}}</strong>
+</div>
+
+</div>
+
+</div>
+
+
+<div class="card">
+
+<h2>System Health</h2>
+
+<div class="metric-row">
+
+<div class="metric">
+    <span class="mini">Broken Components</span>
+    <strong class="bad">{{overview.broken}}</strong>
+</div>
+
+<div class="metric">
+    <span class="mini">Maintenance Due</span>
+    <strong class="warn">{{overview.maintenance_due}}</strong>
+</div>
+
+<div class="metric">
+    <span class="mini">Verified Webhooks</span>
+    <strong class="good">{{overview.events}}</strong>
+</div>
+
+<div class="metric">
+    <span class="mini">Failed Logins</span>
+    <strong class="bad">{{overview.failed_logins}}</strong>
+</div>
+
+</div>
+
+<form method="post" action="/sync" style="margin-top:12px">
+    <button>↻ Sync Simulator Topology</button>
+</form>
+
+</div>
+
+</div>
+
+
+<!-- =====================================================
+     MAINTENANCE
+====================================================== -->
+
+<div class="section-title">Maintenance Intelligence</div>
+
+<div class="two">
+
+<div class="card maintenance-highlight">
+
+<h2>Actual Maintenance Economics</h2>
+
+<div class="metric-row">
+
+<div class="metric">
+    <span class="mini">Preventive Jobs</span>
+    <strong>{{maintenance.preventive_jobs}}</strong>
+</div>
+
+<div class="metric">
+    <span class="mini">Preventive Cost</span>
+    <strong class="warn">
+        {{'%.2f'|format(maintenance.preventive_cost)}}
+    </strong>
+</div>
+
+<div class="metric">
+    <span class="mini">Corrective Jobs</span>
+    <strong>{{maintenance.corrective_jobs}}</strong>
+</div>
+
+<div class="metric">
+    <span class="mini">Corrective Cost</span>
+    <strong class="bad">
+        {{'%.2f'|format(maintenance.corrective_cost)}}
+    </strong>
+</div>
+
+</div>
+
+<p class="mini" style="margin-top:12px">
+Costs shown here are only simulator-confirmed
+<code>RepairCost</code> values from completed repair events.
+</p>
+
+</div>
+
+
+<div class="card">
+
+<h2>Maintenance Cost Breakdown</h2>
+
+<div class="chart-box small">
+    <canvas id="maintenanceChart"></canvas>
+</div>
+
+</div>
+
+</div>
+
+
+<div class="card" style="margin-top:12px">
+
+<div class="card-head">
+<h2>Recent Maintenance Jobs</h2>
+<a href="/maintenance/">View all →</a>
+</div>
+
+<table>
+
+<tr>
+<th>Completed</th>
+<th>Component</th>
+<th>Type</th>
+<th>Duration</th>
+<th>Actual Cost</th>
+</tr>
+
+{% for m in maintenance.recent %}
+
+<tr>
+
+<td>{{m.completed_simulator_time or '-'}}</td>
+
+<td>
+    <b>{{m.component or '-'}}</b>
+    <div class="mini">{{m.kind or ''}}</div>
+</td>
+
+<td>
+    {{m.repair_type or '-'}}
+</td>
+
+<td>
+    {{m.duration}}
+</td>
+
+<td class="good">
+
+{% if m.repair_cost is not none %}
+    <b>{{'%.2f'|format(m.repair_cost)}}</b>
+{% else %}
+    Pending
+{% endif %}
+
+</td>
+
+</tr>
+
+{% else %}
+
+<tr>
+<td colspan="5">No repair jobs recorded yet.</td>
+</tr>
+
+{% endfor %}
+
+</table>
+
+</div>
+
+
+<!-- =====================================================
+     PAYMENTS
+====================================================== -->
+
+<div class="section-title">Financial Transactions</div>
+
+<div class="two">
+
+<div class="card">
+
+<h2>Recent Accepted Payments</h2>
+
+<table>
+
+<tr>
+<th>Simulator Time</th>
+<th>Plate</th>
+<th>Parking</th>
+<th>Charging</th>
+<th>Total</th>
+</tr>
+
+{% for p in payments %}
+
+<tr>
+
+<td>{{p.payment_time}}</td>
+
+<td><b>{{p.plate}}</b></td>
+
+<td>{{'%.2f'|format(p.parking_cost or 0)}}</td>
+
+<td>{{'%.2f'|format(p.charging_cost or 0)}}</td>
+
+<td class="good">
+<b>{{'%.2f'|format(p.actual_paid or 0)}}</b>
+</td>
+
+</tr>
+
+{% else %}
+
+<tr>
+<td colspan="5">No accepted payments yet.</td>
+</tr>
+
+{% endfor %}
+
+</table>
+
+</div>
+
+
+<div class="card">
+
+<h2>Login Security</h2>
+
+<table>
+
+<tr>
+<th>Time</th>
+<th>Name</th>
+<th>Result</th>
+<th>IP</th>
+</tr>
+
+{% for x in logins %}
+
+<tr>
+
+<td>{{x.attempted_at}}</td>
+
+<td>{{x.username}}</td>
+
+<td class="{{'good' if x.success else 'bad'}}">
+{{'SUCCESS' if x.success else 'FAILED'}}
+</td>
+
+<td>{{x.ip}}</td>
+
+</tr>
+
+{% else %}
+
+<tr>
+<td colspan="4">No login attempts.</td>
+</tr>
+
+{% endfor %}
+
+</table>
+
+</div>
+
+</div>
+
+
+
+<!-- =====================================================
+     EXISTING LIVE PARKING CONTROLS — ADMIN ONLY
+====================================================== -->
+<div id="live-control" class="section-title">Live Parking Control & Overrides</div>
+
+<div class="control-grid">
+
+<div class="card">
+<div class="card-head">
+<h2>Gate Manual Overrides</h2>
+<span class="badge">OPEN / CLOSE / AUTO</span>
+</div>
+<div class="control-list">
+{% for g in gate_rows %}
+<div class="control-row">
+<div>
+<b>{{g.name}}</b>
+<div class="mini">{{g.zone}} · {{g.state}} · health {{g.health}}% · override
+<span class="{{'override-open' if g.override == 'OPEN' else 'override-closed' if g.override == 'CLOSED' else 'override-auto'}}"><b>{{g.override}}</b></span>
+{% if g.name == entry_gate %} · ENTRY SPAWN PROTECTED{% endif %}
+{% if g.broken %} · BROKEN{% endif %}{% if g.maintenance %} · MAINTENANCE{% endif %}
+</div>
+</div>
+<div class="control-actions">
+<form method="post" action="/gate/{{g.name}}/open"><button class="btn-green">Open + Hold</button></form>
+<form method="post" action="/gate/{{g.name}}/close"><button class="btn-red" {% if g.name == entry_gate %}disabled title="Entry gate is spawn-path protected"{% endif %}>Close + Hold</button></form>
+<form method="post" action="/gate/{{g.name}}/auto"><button class="btn-gray">Auto</button></form>
+</div>
+</div>
+{% else %}
+<div class="mini">No gates discovered yet.</div>
+{% endfor %}
+</div>
+</div>
+
+<div class="card">
+<div class="card-head">
+<h2>Zone Occupancy</h2>
+<span class="badge">LIVE API CACHE</span>
+</div>
+<div class="zone-grid">
+{% for z in zone_rows %}
+<div class="zone-box">
+<b>{{z.name}}</b>
+<div class="mini">{{z.occupied}} occupied · {{z.free}} free · {{z.reserved}} reserved</div>
+<div class="mini">CO {{z.co if z.co is not none else '-'}} · {{z.risk}}</div>
+<div class="zone-bar"><span style="width:{{z.percent}}%"></span></div>
+</div>
+{% else %}
+<div class="mini">No zones discovered yet.</div>
+{% endfor %}
+</div>
+</div>
+
+</div>
+
+<div class="control-grid">
+
+<div class="card">
+<div class="card-head">
+<h2>Active / Recent Vehicles</h2>
+<a href="/search">Full Search →</a>
+</div>
+<div class="live-table-wrap">
+<table>
+<tr><th>Plate</th><th>Type</th><th>Status</th><th>Spot</th><th>Stay</th><th>Payment</th><th>Actions</th></tr>
+{% for c in cars %}
+<tr>
+<td><b>{{c.plate}}</b></td>
+<td>{{c.car_type or '-'}}</td>
+<td>{{c.status}}</td>
+<td>{{c.assigned_spot or c.actual_spot or '-'}}</td>
+<td>{{c.display_stay}}</td>
+<td>{{c.payment_status}}</td>
+<td>
+<div class="control-actions">
+{% if c.status not in ('LEFT','ESCAPED_UNPAID') %}
+<form method="post" action="/car/{{c.plate}}/exit"><button class="btn-yellow">Exit</button></form>
+<form method="post" action="/car/{{c.plate}}/reassign"><button class="btn-gray">Reassign</button></form>
+{% endif %}
+{% if c.status in ('AT_EXIT','PAYMENT_PENDING','PAYMENT_HOLD') %}
+<form method="post" action="/car/{{c.plate}}/retry-payment"><button>Retry Pay</button></form>
+{% endif %}
+</div>
+</td>
+</tr>
+{% else %}
+<tr><td colspan="7">No vehicles recorded yet.</td></tr>
+{% endfor %}
+</table>
+</div>
+</div>
+
+<div id="critical-alerts" class="card">
+<div class="card-head">
+<h2>Critical Alerts</h2>
+<form method="post" action="/admin/reconcile-alerts"><button class="btn-gray">Resolve Alert Plates</button></form>
+</div>
+<div style="max-height:330px;overflow:auto">
+{% for a in alerts %}
+<div class="alert-row {{'high' if a.severity == 'HIGH' else ''}}">
+<b>{{a.severity or 'ALERT'}} · {{a.alert_type or '-'}}</b>
+<div>{{a.plate or 'Unresolved plate'}} · {{a.reason or '-'}}</div>
+<div class="mini">Entry {{a.display_entry}} · Stay {{a.display_stay}} · Stuck {{a.display_stuck}}</div>
+</div>
+{% else %}
+<div class="mini">No alerts recorded.</div>
+{% endfor %}
+</div>
+</div>
+
+</div>
+
+<div class="card" style="margin-top:12px">
+<div class="card-head"><h2>Administrative Actions</h2><span class="badge">EXISTING PARKMIND FUNCTIONS</span></div>
+<div class="admin-tool-row">
+<form method="post" action="/sync"><button>↻ Sync Simulator Topology</button></form>
+<form method="post" action="/admin/test-webhook"><button>Test Webhook</button></form>
+<form method="post" action="/admin/reconcile-alerts"><button class="btn-gray">Resolve Alert Plates</button></form>
+<form method="post" action="/admin/demo/full"><button>Full Lot Demo</button></form>
+<form method="post" action="/admin/demo/fraud"><button>Payment Fraud Demo</button></form>
+<form method="post" action="/admin/demo/broken_gate"><button>Broken Gate Demo</button></form>
+<form method="post" action="/admin/demo/live_full"><button class="btn-red">LIVE Full Next Car</button></form>
+<form method="post" action="/admin/demo/clear"><button class="btn-gray">Clear Demo</button></form>
+<form method="post" action="/admin/demo/toggle"><button class="btn-yellow">Toggle Judge Demo</button></form>
+</div>
+<div class="mini" style="margin-top:10px">Entry gate: {{entry_gate or '-'}} · Exit gate: {{exit_gate or '-'}} · Last discovery sync: {{last_sync or '-'}} · Judge demo: {{'ON' if demo.enabled else 'OFF'}}</div>
+</div>
+
+
+<div class="footer-note">
+PARKMIND Level 2 · All operational figures are derived from simulator/database events.
+</div>
+
+</div>
+
+
+<script>
+
+const chartFont = {
+    family: "'Segoe UI', Arial",
+    size: 11
+};
+
+Chart.defaults.color = "#94a3b8";
+Chart.defaults.font.family = "'Segoe UI', Arial";
+
+
+// ========================================================
+// 7 DAY REVENUE
+// ========================================================
+
+new Chart(
+    document.getElementById("revenueChart"),
+    {
+        type:"bar",
+
+        data:{
+            labels: {{daily_labels|safe}},
+
+            datasets:[{
+                label:"Revenue",
+                data: {{daily_values|safe}},
+                borderRadius:7,
+                backgroundColor:"#0ea5e9",
+                hoverBackgroundColor:"#38bdf8"
+            }]
+        },
+
+        options:{
+            responsive:true,
+            maintainAspectRatio:false,
+
+            plugins:{
+                legend:{
+                    display:false
+                },
+
+                tooltip:{
+                    callbacks:{
+                        label:function(context){
+                            return " Revenue: " +
+                                Number(context.raw).toFixed(2);
+                        }
+                    }
+                }
+            },
+
+            scales:{
+                x:{
+                    grid:{
+                        display:false
+                    }
+                },
+
+                y:{
+                    beginAtZero:true,
+                    grid:{
+                        color:"rgba(148,163,184,.08)"
+                    }
+                }
+            }
+        }
+    }
+);
+
+
+// ========================================================
+// REVENUE MIX
+// ========================================================
+
+new Chart(
+    document.getElementById("mixChart"),
+    {
+        type:"doughnut",
+
+        data:{
+            labels:["Parking","Charging"],
+
+            datasets:[{
+                data:[
+                    {{mix.parking}},
+                    {{mix.charging}}
+                ],
+
+                backgroundColor:[
+                    "#38bdf8",
+                    "#a78bfa"
+                ],
+
+                borderColor:"#101b2d",
+                borderWidth:4
+            }]
+        },
+
+        options:{
+            responsive:true,
+            maintainAspectRatio:false,
+
+            cutout:"65%",
+
+            plugins:{
+                legend:{
+                    position:"bottom"
+                }
+            }
+        }
+    }
+);
+
+
+// ========================================================
+// HOURLY
+// ========================================================
+
+new Chart(
+    document.getElementById("hourlyChart"),
+    {
+        type:"line",
+
+        data:{
+            labels: {{hour_labels|safe}},
+
+            datasets:[{
+                label:"Revenue",
+                data: {{hour_values|safe}},
+                borderColor:"#22d3ee",
+                backgroundColor:"rgba(34,211,238,.10)",
+                fill:true,
+                tension:.35,
+                pointRadius:2
+            }]
+        },
+
+        options:{
+            responsive:true,
+            maintainAspectRatio:false,
+
+            plugins:{
+                legend:{
+                    display:false
+                }
+            },
+
+            scales:{
+                x:{
+                    grid:{
+                        display:false
+                    }
+                },
+
+                y:{
+                    beginAtZero:true,
+                    grid:{
+                        color:"rgba(148,163,184,.08)"
+                    }
+                }
+            }
+        }
+    }
+);
+
+
+// ========================================================
+// TODAY VS YESTERDAY
+// ========================================================
+
+new Chart(
+    document.getElementById("comparisonChart"),
+    {
+        type:"bar",
+
+        data:{
+            labels:["Yesterday","Today"],
+
+            datasets:[{
+                data:[
+                    {{yesterday.revenue}},
+                    {{today.revenue}}
+                ],
+
+                backgroundColor:[
+                    "#64748b",
+                    "#22c55e"
+                ],
+
+                borderRadius:8
+            }]
+        },
+
+        options:{
+            responsive:true,
+            maintainAspectRatio:false,
+
+            plugins:{
+                legend:{
+                    display:false
+                }
+            },
+
+            scales:{
+                x:{
+                    grid:{
+                        display:false
+                    }
+                },
+
+                y:{
+                    beginAtZero:true,
+                    grid:{
+                        color:"rgba(148,163,184,.08)"
+                    }
+                }
+            }
+        }
+    }
+);
+
+
+// ========================================================
+// MAINTENANCE COST
+// ========================================================
+
+new Chart(
+    document.getElementById("maintenanceChart"),
+    {
+        type:"doughnut",
+
+        data:{
+            labels:["Preventive","Corrective"],
+
+            datasets:[{
+                data:[
+                    {{maintenance.preventive_cost}},
+                    {{maintenance.corrective_cost}}
+                ],
+
+                backgroundColor:[
+                    "#fbbf24",
+                    "#f87171"
+                ],
+
+                borderColor:"#101b2d",
+                borderWidth:4
+            }]
+        },
+
+        options:{
+            responsive:true,
+            maintainAspectRatio:false,
+
+            cutout:"62%",
+
+            plugins:{
+                legend:{
+                    position:"bottom"
+                }
+            }
+        }
+    }
+);
+
+
+// ========================================================
+// AUTO REFRESH
+// ========================================================
+
+setTimeout(function(){
+    window.location.reload();
+},10000);
+
+</script>
+
+</body>
+</html>
+
+'''
+
+
+def _admin_dashboard_context(spot_rows, gate_rows, fan_rows, zone_rows, alerts, snapshot_stats):
+    """Build the Admin Command Centre analytics from the existing PARKMIND DB/state."""
+    conn = db()
+
+    sim_time = str(last_simulator_time or "")
+    today_date = sim_time[:10] if len(sim_time) >= 10 else datetime.now().strftime("%Y-%m-%d")
+    try:
+        today_dt = datetime.strptime(today_date, "%Y-%m-%d").date()
+        yesterday_date = (today_dt - timedelta(days=1)).isoformat()
+    except Exception:
+        today_dt = datetime.now().date()
+        today_date = today_dt.isoformat()
+        yesterday_date = (today_dt - timedelta(days=1)).isoformat()
+
+    time_expr = "COALESCE(departure_time, exit_arrival_time, parked_time, entry_time, '')"
+
+    def paid_stats(day):
+        try:
+            row = conn.execute(
+                f"""SELECT COALESCE(SUM(actual_paid),0) revenue, COUNT(*) paid_cars
+                    FROM cars
+                    WHERE payment_status='PAID'
+                      AND substr({time_expr},1,10)=?""",
+                (day,)
+            ).fetchone()
+            revenue = float(row["revenue"] or 0)
+            paid = int(row["paid_cars"] or 0)
+            return {"revenue": revenue, "paid_cars": paid, "avg_ticket": revenue / paid if paid else 0.0}
+        except Exception:
+            return {"revenue": 0.0, "paid_cars": 0, "avg_ticket": 0.0}
+
+    today = paid_stats(today_date)
+    yesterday = paid_stats(yesterday_date)
+    delta = None
+    if yesterday["revenue"] > 0:
+        delta = ((today["revenue"] - yesterday["revenue"]) / yesterday["revenue"]) * 100
+    delta_text = "N/A" if delta is None else f"{delta:+.1f}%"
+
+    daily_labels, daily_values = [], []
+    for i in range(6, -1, -1):
+        ds = (today_dt - timedelta(days=i)).isoformat()
+        daily_labels.append(ds[5:])
+        daily_values.append(paid_stats(ds)["revenue"])
+
+    try:
+        mixrow = conn.execute(
+            f"""SELECT COALESCE(SUM(parking_cost),0) p, COALESCE(SUM(charging_cost),0) c
+                FROM cars
+                WHERE payment_status='PAID'
+                  AND substr({time_expr},1,10)=?""",
+            (today_date,)
+        ).fetchone()
+        parking = float(mixrow["p"] or 0)
+        charging = float(mixrow["c"] or 0)
+    except Exception:
+        parking = charging = 0.0
+    mix = {"parking": parking, "charging": charging}
+
+    hour_labels = [f"{h:02d}" for h in range(24)]
+    hour_values = []
+    for hh in hour_labels:
+        try:
+            row = conn.execute(
+                f"""SELECT COALESCE(SUM(actual_paid),0) r
+                    FROM cars
+                    WHERE payment_status='PAID'
+                      AND substr({time_expr},1,10)=?
+                      AND substr({time_expr},12,2)=?""",
+                (today_date, hh)
+            ).fetchone()
+            hour_values.append(float(row["r"] or 0))
+        except Exception:
+            hour_values.append(0.0)
+
+    def sql_count(sql, args=()):
+        try:
+            return int(conn.execute(sql, args).fetchone()[0] or 0)
+        except Exception:
+            return 0
+
+    arrivals = sql_count("SELECT COUNT(*) FROM cars WHERE substr(entry_time,1,10)=?", (today_date,))
+    departures = sql_count("SELECT COUNT(*) FROM cars WHERE substr(departure_time,1,10)=?", (today_date,))
+    verified_events = sql_count(
+        "SELECT COUNT(*) FROM events WHERE signature_verified=1 AND substr(server_time,1,10)=?",
+        (today_date,)
+    )
+    co_incidents = sql_count(
+        """SELECT COUNT(*) FROM alerts
+           WHERE (LOWER(COALESCE(alert_type,'')) LIKE '%co%'
+              OR LOWER(COALESCE(reason,'')) LIKE '%carbon monoxide%')
+             AND substr(COALESCE(event_time,created_at,''),1,10)=?""",
+        (today_date,)
+    )
+
+    broken_names = set()
+    maintenance_names = set()
+    for row in list(spot_rows) + list(gate_rows) + list(fan_rows):
+        if row.get("broken"):
+            broken_names.add((row.get("name"), row.get("zone", "")))
+        if row.get("maintenance") or int(row.get("health") or 100) <= PREVENTIVE_MAINTENANCE_HEALTH:
+            maintenance_names.add((row.get("name"), row.get("zone", "")))
+
+    critical_alerts = sum(1 for a in alerts if str(a.get("severity") or "").upper() == "CRITICAL")
+    operations = {
+        "arrivals": arrivals,
+        "departures": departures,
+        "penalties": int(snapshot_stats.get("total_penalties", 0) or 0),
+        "co_incidents": co_incidents,
+    }
+    overview = {
+        "alerts": critical_alerts,
+        "broken": len(broken_names),
+        "maintenance_due": len(maintenance_names),
+        "events": verified_events,
+        # Existing PARKMIND login flow does not persist a login-attempt table.
+        "failed_logins": 0,
+    }
+
+    # Existing maintenance dashboard records job lifecycle, not monetary repair cost.
+    # Keep the supplied Admin layout without inventing costs.
+    recent_maintenance = []
+    preventive_jobs = corrective_jobs = 0
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "maintenance_dashboard_jobs" in tables:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM maintenance_dashboard_jobs ORDER BY id DESC LIMIT 8"
+            ).fetchall()]
+            for m in rows:
+                rtype = str(m.get("repair_type") or "").upper()
+                if rtype == "PREVENTIVE":
+                    preventive_jobs += 1
+                elif rtype == "CORRECTIVE":
+                    corrective_jobs += 1
+                start = m.get("start_sim_time") or m.get("started_at")
+                end = m.get("completed_sim_time")
+                duration = format_duration(seconds_between(start, end)) if start and end else "-"
+                recent_maintenance.append({
+                    "completed_simulator_time": end or "-",
+                    "component": m.get("component") or "-",
+                    "kind": m.get("kind") or "",
+                    "repair_type": m.get("repair_type") or "-",
+                    "duration": duration,
+                    "repair_cost": None,
+                })
+    except Exception:
+        recent_maintenance = []
+
+    maintenance = {
+        "today_cost": 0.0,
+        "revenue_after_maintenance": today["revenue"],
+        "preventive_jobs": preventive_jobs,
+        "preventive_cost": 0.0,
+        "corrective_jobs": corrective_jobs,
+        "corrective_cost": 0.0,
+        "recent": recent_maintenance,
+    }
+
+    try:
+        payments = [dict(r) for r in conn.execute(
+            f"""SELECT {time_expr} AS payment_time, plate, parking_cost, charging_cost, actual_paid
+                FROM cars
+                WHERE payment_status='PAID'
+                ORDER BY {time_expr} DESC
+                LIMIT 8"""
+        ).fetchall()]
+    except Exception:
+        payments = []
+
+    conn.close()
+
+    return {
+        "today_date": today_date,
+        "sim_time": sim_time,
+        "today": today,
+        "yesterday": yesterday,
+        "delta": delta,
+        "delta_text": delta_text,
+        "daily_labels": json.dumps(daily_labels),
+        "daily_values": json.dumps(daily_values),
+        "mix": mix,
+        "hour_labels": json.dumps(hour_labels),
+        "hour_values": json.dumps(hour_values),
+        "overview": overview,
+        "operations": operations,
+        "maintenance": maintenance,
+        "payments": payments,
+        "logins": [],
+    }
+
+
 DASH_HTML = """
 <!doctype html>
 <html>
@@ -4154,10 +5710,11 @@ OPERATOR VIEW — live vehicle status, alerts, gate control and recovery actions
 <h2>Gate Control</h2>
 {% for g in gate_rows %}
 <div class="gate">
-<div><b>{{g.name}}</b><div class="mini">{{g.zone}} · {{g.state}} · health {{g.health}}% {% if g.broken %}· BROKEN{% endif %}{% if g.maintenance %} · MAINTENANCE{% endif %}</div></div>
+<div><b>{{g.name}}</b><div class="mini">{{g.zone}} · {{g.state}} · health {{g.health}}% · override <b>{{g.override}}</b> {% if g.broken %}· BROKEN{% endif %}{% if g.maintenance %} · MAINTENANCE{% endif %}</div></div>
 <div>
 <form method="post" action="/gate/{{g.name}}/open"><button>Open</button></form>
 <form method="post" action="/gate/{{g.name}}/close"><button class="gray">Close</button></form>
+<form method="post" action="/gate/{{g.name}}/auto"><button class="gray">Auto</button></form>
 {% if g.broken and not g.maintenance %}<form method="post" action="/component/gate/{{g.name}}/repair"><button class="danger">Repair</button></form>{% endif %}
 </div>
 </div>
@@ -4478,6 +6035,8 @@ def dashboard():
             "broken": bool(g.get("broken", False) or n in alarms),
             "maintenance": bool(g.get("isUnderMaintenance", False)),
             "health": component_health_score(n, "gate"),
+            "override": ("OPEN" if manual_overrides["gate"].get(n) is True else
+                         "CLOSED" if manual_overrides["gate"].get(n) is False else "AUTO"),
         } for n, g in gates.items()]
 
         fan_rows = [{
@@ -4643,6 +6202,26 @@ def dashboard():
         0, capacity["total"] - capacity["occupied"] - capacity["reserved"]
     )
 
+    if require_admin():
+        admin_ctx = _admin_dashboard_context(
+            spot_rows, gate_rows, fan_rows, zone_rows, alerts, snapshot_stats
+        )
+        return render_template_string(
+            ADMIN_DASH_HTML,
+            user=session["user"], role=session["role"],
+            spot_rows=spot_rows, gate_rows=gate_rows, cars=cars,
+            alerts=alerts, capacity=capacity,
+            decisions=decisions, spot_analytics=spot_analytics,
+            stats=snapshot_stats,
+            entry_gate=ENTRY_GATE, exit_gate=EXIT_GATE,
+            perimeter_gates=perimeter_gates, zone_gates=dict(zone_gates),
+            exit_waiting=len(physical_exit_queue),
+            zone_rows=zone_rows, fan_rows=fan_rows, light_rows=light_rows, alarm_rows=alarm_rows,
+            simulator_time=last_simulator_time, last_sync=last_sync_at,
+            arrival_bars=arrival_bars, demo=demo_state,
+            **admin_ctx
+        )
+
     return render_template_string(
         DASH_HTML, user=session["user"], role=session["role"],
         spot_rows=spot_rows, gate_rows=gate_rows, cars=cars,
@@ -4655,7 +6234,7 @@ def dashboard():
         zone_rows=zone_rows, fan_rows=fan_rows, light_rows=light_rows, alarm_rows=alarm_rows,
         simulator_time=last_simulator_time, last_sync=last_sync_at,
         arrival_bars=arrival_bars,
-        is_admin=require_admin(),
+        is_admin=False,
         demo=demo_state
     )
 
@@ -4749,12 +6328,53 @@ def manual_gate(name, action):
     if not require_login():
         return redirect(url_for("login"))
     try:
-        if action == "open":
-            open_gate(name)
+        if name not in gates:
+            return ("Unknown gate - not present in simulator discovery cache", 404)
+
+        if action == "auto":
+            with state_lock:
+                manual_overrides["gate"].pop(name, None)
+                manual_gate_closed.discard(name)
+            log_decision(
+                "", "MANUAL_GATE_AUTO", name,
+                "Operator returned gate control to PARKMIND automation."
+            )
+            # Re-apply the normal idle policy immediately where possible.
+            ensure_keep_open_gates()
+
+        elif action == "open":
+            # Persist OPEN before sending the command so concurrent watchdogs
+            # cannot race in and close the gate a moment later.
+            with state_lock:
+                manual_overrides["gate"][name] = True
+                manual_gate_closed.discard(name)
+            if str(gates.get(name, {}).get("state") or "") not in ("Open", "Opening"):
+                open_gate(name, manual=True)
+            log_decision(
+                "", "MANUAL_GATE_OPEN_HOLD", name,
+                "Dashboard OPEN override enabled; automation is not allowed to close this gate until AUTO or CLOSE is selected."
+            )
+
         elif action == "close":
-            close_gate(name)
+            if name == ENTRY_GATE:
+                log_decision(
+                    "", "MANUAL_ENTRY_CLOSE_BLOCKED", name,
+                    "Dashboard close rejected because this barrier is required for simulator arrival spawning."
+                )
+            else:
+                with state_lock:
+                    manual_overrides["gate"][name] = False
+                    manual_gate_closed.add(name)
+                if str(gates.get(name, {}).get("state") or "") not in ("Closed", "Closing"):
+                    close_gate(name, force=True, manual=True)
+                log_decision(
+                    "", "MANUAL_GATE_CLOSED_HOLD", name,
+                    "Dashboard CLOSE override enabled; automation is not allowed to reopen this gate until AUTO or OPEN is selected."
+                )
+        else:
+            return ("Invalid gate action", 400)
     except Exception as e:
-        log_decision("", "MANUAL_GATE_ERROR", str(e))
+        log_decision("", "MANUAL_GATE_ERROR", f"{name}: {e}")
     return redirect(url_for("dashboard"))
 
 
@@ -6235,9 +7855,8 @@ def _build_maintenance_blueprint():
     <form method="post"
           action="/maintenance/manual/gate/{{c.name}}/open">
 
-    <button class="btn-green"
-            {% if c.state|lower == 'open' %}disabled{% endif %}>
-        ↑ OPEN
+    <button class="btn-green">
+        ↑ OPEN + HOLD
     </button>
 
     </form>
@@ -6245,9 +7864,17 @@ def _build_maintenance_blueprint():
     <form method="post"
           action="/maintenance/manual/gate/{{c.name}}/close">
 
-    <button class="btn-blue"
-            {% if c.state|lower == 'closed' %}disabled{% endif %}>
-        ↓ CLOSE
+    <button class="btn-blue">
+        ↓ CLOSE + HOLD
+    </button>
+
+    </form>
+
+    <form method="post"
+          action="/maintenance/manual/gate/{{c.name}}/auto">
+
+    <button class="btn-blue">
+        AUTO
     </button>
 
     </form>
@@ -7967,18 +9594,40 @@ def _build_maintenance_blueprint():
                 )
             ).lower()
 
-
-            if action == "open" and state == "open":
-
-                return False, (
-                    f"{name} is already OPEN."
+            if action == "auto":
+                with state_lock:
+                    manual_overrides["gate"].pop(name, None)
+                    manual_gate_closed.discard(name)
+                ensure_keep_open_gates()
+                return True, (
+                    f"{name} returned to AUTO control."
                 )
 
-
-            if action == "close" and state == "closed":
-
+            if action == "close" and name == ENTRY_GATE:
                 return False, (
-                    f"{name} is already CLOSED."
+                    f"{name} is the API-discovered entry gate and cannot be held CLOSED because that would break the simulator arrival path."
+                )
+
+            if action == "open":
+                with state_lock:
+                    manual_overrides["gate"][name] = True
+                    manual_gate_closed.discard(name)
+                if state not in ("open", "opening"):
+                    if not open_gate(name, manual=True):
+                        return False, f"Could not open {name}."
+                return True, (
+                    f"{name} is now MANUAL OPEN; automation cannot close it until AUTO or CLOSE is selected."
+                )
+
+            if action == "close":
+                with state_lock:
+                    manual_overrides["gate"][name] = False
+                    manual_gate_closed.add(name)
+                if state not in ("closed", "closing"):
+                    if not close_gate(name, force=True, manual=True):
+                        return False, f"Could not close {name}."
+                return True, (
+                    f"{name} is now MANUAL CLOSED; automation cannot open it until AUTO or OPEN is selected."
                 )
 
 
@@ -8524,7 +10173,8 @@ def _build_maintenance_blueprint():
 
         if action not in {
             "open",
-            "close"
+            "close",
+            "auto"
         }:
 
             flash(
@@ -9391,6 +11041,7 @@ if __name__ == "__main__":
     try:
         sim_login()
         sync_state()
+        ensure_keep_open_gates()
         # One API-triggered test webhook establishes ServerDateTime immediately,
         # allowing morning/night lighting policy without polling or wall-clock guesses.
         try:
@@ -9406,7 +11057,7 @@ if __name__ == "__main__":
         print("[STARTUP] Start the simulator; PARKMIND will safely sync on the first arrival.")
 
     print("\n============================================")
-    print("  PARKMIND v2.8 — Race-Safe Payment + Two-Stage Exit Edition")
+    print("  PARKMIND v3.0 — Persistent Manual Gate Override + Race-Safe Exit Edition")
     print("  Team: Pretty Little Hackers")
     print("  Dashboard: http://127.0.0.1:8000")
     print("  Webhook:   http://127.0.0.1:8000/webhook")
@@ -9416,6 +11067,7 @@ if __name__ == "__main__":
     print("  API-derived exit alias: ", EXIT_GATE, "(derived from /list-barriers)")
     print("  Entry control: ZONE-SPILLOVER (busy first zone -> next zone; no internal pile-up)")
     print("  Exit control: TWO-STAGE + HARD PAYMENT LOCK (no payment = no leavepark)")
+    print("  Entry spawn guard: HARD-LOCKED OPEN (prevents A -> P2 no-path errors)")
     print("  Gate retries: debounced (will not spam OPEN while already Opening/Open)")
     print("============================================\n")
 
