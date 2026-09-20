@@ -1,5 +1,5 @@
 # =====================================================================
-#  PARKMIND v3.5  —  LEVEL 3 AIRPORT / FULL-DATABASE + BURST-OPTIMIZED Edition
+#  PARKMIND v3.7  —  LEVEL 3 AIRPORT / API-SAFE ENTRY ROUTING + FULL-DATABASE Edition
 #  Team: Pretty Little Hackers  |  Level: 3 — Airport Scale
 #  Team members: Sharmila, Jushita, Pravir, Ram
 # =====================================================================
@@ -51,6 +51,12 @@
 #  [22] Debounced Runtime Checkpointing — raw events remain durable immediately, while
 #       expensive full-state checkpoints are coalesced during bursts and persistence
 #       failures are isolated from successful event processing.
+#  [23] Airport Manual Control Centre — every API-discovered gate, fan and light can
+#       be overridden from a zone-aware GUI; commands are safety-checked, audited
+#       to SQLite and immediately included in the durable runtime checkpoint.
+#  [24] API-Safe Entry Admission — a car is assigned only to a zone whose gate
+#       crossing is free; required barriers must report Open before the documented
+#       /car/{plate}/goto/{parkingSpot} command is sent. Busy zones spill forward.
 # =====================================================================
 
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, Response
@@ -315,6 +321,7 @@ last_processed_sequence = None
 # event worker never compete with each other for the same expensive checkpoint.
 runtime_persist_lock = threading.RLock()
 runtime_persist_meta_lock = threading.Lock()
+db_write_lock = threading.RLock()
 last_runtime_persist_monotonic = 0.0
 events_since_runtime_persist = 0
 
@@ -322,6 +329,33 @@ events_since_runtime_persist = 0
 # =====================================================================
 # DATABASE
 # =====================================================================
+def _run_sqlite_write(sql, params=(), retries=8):
+    """Serialize SQLite writes and retry transient database-locked errors."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            with db_write_lock:
+                conn = db()
+                try:
+                    conn.execute(sql, params)
+                    conn.commit()
+                    return True
+                finally:
+                    conn.close()
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            if attempt < retries - 1:
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    return False
+
+
 def db():
     # WAL lets dashboard readers continue while webhook/event workers are writing.
     # busy_timeout absorbs short write bursts instead of surfacing "database locked".
@@ -432,6 +466,25 @@ def init_db():
         state_hash TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_persistence_log_saved ON persistence_log(saved_at DESC);
+
+    CREATE TABLE IF NOT EXISTS manual_override_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        username TEXT,
+        role TEXT,
+        component_type TEXT NOT NULL,
+        component_name TEXT NOT NULL,
+        zone_parent TEXT,
+        action TEXT NOT NULL,
+        previous_state TEXT,
+        result TEXT NOT NULL,
+        detail TEXT,
+        state_after TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_manual_override_created
+        ON manual_override_log(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_manual_override_component
+        ON manual_override_log(component_type, component_name, id DESC);
 
     CREATE TABLE IF NOT EXISTS cars (
         plate TEXT PRIMARY KEY,
@@ -617,55 +670,75 @@ def format_duration(seconds):
 
 
 def log_decision(plate, action, detail, reasoning=""):
-    conn = db()
-    conn.execute(
+    _run_sqlite_write(
         "INSERT INTO decisions(created_at, plate, action, detail, reasoning) VALUES(?,?,?,?,?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, action, detail, reasoning)
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, action, detail, reasoning),
     )
-    conn.commit()
-    conn.close()
     print(f"[DECISION] {plate or '-'} | {action} | {detail} | {reasoning}")
 
 
-def log_anomaly(plate, kind, detail):
-    conn = db()
-    conn.execute(
-        "INSERT INTO anomalies(detected_at, plate, kind, detail) VALUES(?,?,?,?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, kind, detail)
+def log_manual_override(component_type, component_name, action, previous_state, result, detail, state_after=""):
+    """Durable audit trail for every Level-3 GUI manual-control command."""
+    username = str(session.get("user") or "system")
+    role = str(session.get("role") or "SYSTEM")
+    zone_parent = _component_zone(component_name) if component_name else ""
+    _run_sqlite_write(
+        """INSERT INTO manual_override_log(
+               created_at,username,role,component_type,component_name,zone_parent,
+               action,previous_state,result,detail,state_after
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), username, role,
+            str(component_type or ""), str(component_name or ""), zone_parent,
+            str(action or "").upper(), str(previous_state or ""),
+            str(result or ""), str(detail or ""), str(state_after or "")
+        ),
     )
-    conn.commit()
-    conn.close()
+
+
+def checkpoint_manual_override(reason):
+    """Manual commands are low-rate: persist them immediately instead of waiting for debounce."""
+    try:
+        persist_runtime_state(f"manual-control:{reason}", write_history=True)
+        return True
+    except Exception as exc:
+        try:
+            log_decision("", "MANUAL_PERSIST_FAIL", str(exc), reason)
+        except Exception:
+            print("[MANUAL PERSIST FAIL]", reason, exc)
+        return False
+
+
+def log_anomaly(plate, kind, detail):
+    _run_sqlite_write(
+        "INSERT INTO anomalies(detected_at, plate, kind, detail) VALUES(?,?,?,?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, kind, detail),
+    )
     with state_lock:
         stats["anomalies_flagged"] += 1
     print(f"[ANOMALY] {plate or '-'} | {kind} | {detail}")
 
 
 def log_fraud(plate, reason, attempted_amount):
-    conn = db()
-    conn.execute(
+    _run_sqlite_write(
         "INSERT INTO fraud_log(detected_at, plate, reason, attempted_amount) VALUES(?,?,?,?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, reason, attempted_amount)
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, reason, attempted_amount),
     )
-    conn.commit()
-    conn.close()
     with state_lock:
         stats["fraud_attempts_blocked"] += 1
     print(f"[FRAUD BLOCKED] {plate or '-'} | {reason} | amount={attempted_amount}")
 
 
 def log_penalty(reason, fine_amount, payload=None):
-    conn = db()
-    conn.execute(
+    _run_sqlite_write(
         "INSERT INTO penalties(detected_at, reason, fine_amount, payload) VALUES(?,?,?,?)",
         (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             str(reason or ""),
             float(fine_amount or 0),
             json.dumps(payload or {})
-        )
+        ),
     )
-    conn.commit()
-    conn.close()
     with state_lock:
         stats["total_penalties"] += 1
     print(f"[PENALTY] {reason} | fine={fine_amount}")
@@ -690,8 +763,7 @@ def log_network_security(category, data=None, detail="", fingerprint="", remote_
     except Exception:
         full_payload = str(data or raw_preview or "")
     preview = str(preview)[:SECURITY_PAYLOAD_PREVIEW]
-    conn = db()
-    cur = conn.execute(
+    _run_sqlite_write(
         """INSERT INTO network_security_log(
                received_at, category, event_id, sequence_id, event_class,
                remote_addr, request_fingerprint, detail, payload_preview, payload_full
@@ -705,20 +777,18 @@ def log_network_security(category, data=None, detail="", fingerprint="", remote_
             str(remote_addr or ""),
             str(fingerprint or ""),
             str(detail or ""),
-            preview,
-            full_payload,
-        )
+            str(preview or ""),
+            str(full_payload or "")
+        ),
     )
     # Bound hostile/duplicate log growth without depending on AUTOINCREMENT ids.
     # A cheap 1% sampling keeps cleanup amortised and still caps long-running logs.
     if SECURITY_LOG_MAX_ROWS > 0 and random.random() < 0.01:
-        conn.execute(
+        _run_sqlite_write(
             "DELETE FROM network_security_log WHERE id NOT IN "
             "(SELECT id FROM network_security_log ORDER BY id DESC LIMIT ?)",
-            (SECURITY_LOG_MAX_ROWS,)
+            (SECURITY_LOG_MAX_ROWS,),
         )
-    conn.commit()
-    conn.close()
 
 
 def canonical_event_key(data, fingerprint=""):
@@ -905,7 +975,8 @@ def _persist_runtime_state_impl(reason="checkpoint", write_history=False):
         "physical_exit_queue": queues.get("physical_exit_queue", []),
     }
 
-    conn = db()
+    with db_write_lock:
+        conn = db()
     try:
         conn.execute("BEGIN IMMEDIATE")
         old = conn.execute(
@@ -3001,7 +3072,27 @@ def try_dispatch_entry_when_ready(plate):
         spot = active.get("spot")
         target_zone = str(active.get("zone") or "")
 
+    # The car must never be sent while any selected barrier is merely Opening or
+    # Closed.  Only the simulator's gate_action state == Open authorizes motion.
     if required and not all(gate_fully_open(name) for name in required):
+        return False
+
+    # Revalidate the API-discovered route immediately before goto. This catches a
+    # failure/maintenance/manual-close event that arrived after assignment but
+    # before the car was released.
+    if target_zone and zone_gates.get(target_zone):
+        selected_zone_gate = any(name in zone_gates.get(target_zone, []) for name in required)
+        if not selected_zone_gate:
+            log_decision(plate, "ENTRY_ROUTE_INVALID", f"No selected gate for {target_zone}",
+                         "goto blocked; route no longer satisfies discovered topology.")
+            return False
+    if perimeter_gates:
+        selected_perimeter = any(name in perimeter_gates for name in required)
+        if not selected_perimeter:
+            log_decision(plate, "ENTRY_ROUTE_INVALID", "No selected perimeter entry gate",
+                         "goto blocked; route no longer satisfies discovered topology.")
+            return False
+    if any(not gate_route_available(name) for name in required):
         return False
 
     try:
@@ -3052,12 +3143,37 @@ def close_entry_if_idle():
     ensure_keep_open_gates()
 
 
+def _validate_api_car_destination(destination):
+    """Validate the simulator's documented goto destination contract.
+
+    The supplied API documents exactly three destination forms:
+      * a discovered parking-spot name;
+      * ``exit``;
+      * ``leavepark``.
+
+    Refusing an unknown destination here prevents a controller bug or malformed
+    internal state from producing an unsupported simulator command.
+    """
+    dest = str(destination or "").strip()
+    if dest in ("exit", "leavepark"):
+        return dest
+    if dest in spots:
+        return dest
+    raise ValueError(f"Unsupported simulator goto destination: {destination!r}")
+
+
 def send_car(plate, destination):
-    """Send a simulator car to a parking spot / exit / leavepark."""
-    plate_path = quote(str(plate).replace(" ", ""), safe="")
-    dest_path = quote(str(destination), safe="")
+    """Send a car using only the documented simulator ``goto`` endpoint."""
+    plate = str(plate or "").strip()
+    if not plate:
+        raise ValueError("Cannot route a car without a plate identifier")
+    destination = _validate_api_car_destination(destination)
+    # API documentation explicitly allows plate identifiers with or without
+    # spaces.  Compacting keeps the existing stable PARKMIND behaviour.
+    plate_path = quote(plate.replace(" ", ""), safe="")
+    dest_path = quote(destination, safe="")
     sim_request("POST", f"/car/{plate_path}/goto/{dest_path}")
-    log_decision(plate, "CAR_GOTO", destination)
+    log_decision(plate, "CAR_GOTO", destination, "Simulator API contract validated before dispatch.")
 
 
 def charge_car(plate, parking_cost, charging_cost):
@@ -3791,6 +3907,23 @@ def process_entry_queue():
             return
 
         target_zone = str(spots.get(spot, {}).get("zoneParent") or "")
+
+        # Judge/operator-visible Level-3 behaviour: when a lower-numbered zone
+        # already owns its gate crossing, the selector deliberately spills this
+        # arrival into the next compatible free zone instead of queueing two cars
+        # behind the same barrier.  The decision is persisted in SQLite.
+        if "SPILLED_PAST_BUSY=" in str(reason):
+            log_decision(
+                plate, "ZONE_BUSY_SPILLOVER",
+                f"Assigned {spot} in {target_zone}; {reason}",
+                "Another vehicle owns the skipped zone gate path, so this car uses a different zone."
+            )
+        if "SPILLED_PAST_FAILED_GATES=" in str(reason):
+            log_decision(
+                plate, "ZONE_GATE_FAILOVER_ASSIGNMENT",
+                f"Assigned {spot} in {target_zone}; {reason}",
+                "Broken/maintenance/manual-closed gate path was excluded before assignment."
+            )
 
         # Race-condition guard: the selector already skips busy zones, but a
         # webhook/thread could claim this zone between selection and reservation.
@@ -5651,7 +5784,7 @@ button:hover{filter:brightness(1.15)}
 .badge{display:inline-block;background:#0f172a;color:#22d3ee;padding:4px 10px;border-radius:8px;font-size:11px;margin:2px}
 </style>
 <div class="card">
-<h1>PARKMIND v3.5</h1>
+<h1>PARKMIND v3.7</h1>
 <p class="sub">Pretty Little Hackers — Level 3 Airport Control Center</p>
 <div style="margin:10px 0">
 <span class="badge">Signature Verified</span>
@@ -5753,6 +5886,7 @@ summary{cursor:pointer;color:#cbd5e1;font-size:11px;font-weight:700}
 <div class="toolbar">
 <span class="role">{{role}} · {{user}}</span>
 <a href="/search">Search</a>
+<a href="/control">Control Centre</a>
 {% if is_admin %}<a href="/maintenance/">Maintenance</a><a href="/admin/security">Security</a><a href="/admin/database">Database</a><a href="/export/cars">Export</a>{% endif %}
 <a href="/logout">Logout</a>
 </div>
@@ -6061,6 +6195,55 @@ No dashboard polling of discovery endpoints.
 </html>
 """
 
+
+
+CONTROL_HTML = """
+<!doctype html>
+<html>
+<head>
+<title>PARKMIND v3.7 · Airport Control Centre</title>
+<style>
+*{box-sizing:border-box}body{font-family:'Segoe UI',Arial;margin:0;background:#07111f;color:#e5e7eb}
+header{position:sticky;top:0;z-index:10;background:#0f172a;border-bottom:1px solid #263244;padding:13px 18px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+a{color:#67e8f9;text-decoration:none}.brand{font-size:20px;font-weight:900;color:#67e8f9}.sub{font-size:11px;color:#94a3b8}.page{max-width:1650px;margin:auto;padding:14px}
+.metrics{display:grid;grid-template-columns:repeat(6,minmax(110px,1fr));gap:8px}.metric,.card{background:#0f172a;border:1px solid #263244;border-radius:12px}.metric{padding:10px}.metric b{font-size:21px}.metric span{display:block;color:#94a3b8;font-size:10px;text-transform:uppercase;margin-top:3px}
+.toolbar{display:flex;gap:7px;flex-wrap:wrap;align-items:center}.toolbar input,.toolbar select{background:#07111f;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:7px 9px}.card{padding:12px;margin-top:10px}.card h2{font-size:14px;margin:0;color:#cbd5e1;text-transform:uppercase;letter-spacing:.6px}
+.section-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:9px}.group{border:1px solid #263244;border-radius:11px;margin:9px 0;overflow:hidden}.group-head{background:#111c2e;padding:9px 11px;display:flex;justify-content:space-between;align-items:center;gap:8px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:8px;padding:8px}.component{background:#081421;border:1px solid #203047;border-radius:10px;padding:10px}.row{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.name{font-weight:850;font-size:14px}.mini{font-size:10px;color:#94a3b8;margin-top:3px}.bad{color:#fca5a5}.warn{color:#fbbf24}.good{color:#86efac}.cyan{color:#67e8f9}.badge{font-size:9px;padding:3px 6px;border-radius:999px;background:#1e293b;display:inline-block;margin:1px}.badge.manual{background:#4c1d95;color:#ddd6fe}.badge.open{background:#064e3b;color:#a7f3d0}.badge.closed{background:#3f1d24;color:#fecaca}.badge.auto{background:#164e63;color:#a5f3fc}
+button{border:0;border-radius:7px;padding:6px 8px;color:#fff;font-size:10px;font-weight:700;cursor:pointer;margin:2px 1px;background:#0369a1}.openbtn{background:#047857}.closebtn{background:#b91c1c}.autobtn{background:#475569}.bulk{background:#7c3aed}.disabled{opacity:.45}.controls{margin-top:8px;display:flex;flex-wrap:wrap}.note{padding:9px;border-radius:9px;background:#082f49;border:1px solid #0e7490;color:#bae6fd;font-size:11px;margin:10px 0}.warning{background:#3b2109;border-color:#92400e;color:#fde68a}
+table{width:100%;border-collapse:collapse;font-size:11px}th,td{padding:7px;border-bottom:1px solid #263244;text-align:left}th{font-size:9px;text-transform:uppercase;color:#94a3b8}.scroll{max-height:300px;overflow:auto}.hiddenByFilter{display:none!important}
+@media(max-width:900px){.metrics{grid-template-columns:repeat(2,1fr)}header{align-items:flex-start}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header><div><div class="brand">PARKMIND · AIRPORT CONTROL CENTRE</div><div class="sub">Level 3 manual override · live API state · SQLite audit</div></div><div class="toolbar"><span class="badge">{{role}} · {{user}}</span><a href="/">Dashboard</a><a href="/maintenance/">Maintenance</a>{% if is_admin %}<a href="/admin/security">Security</a><a href="/admin/database">Database</a>{% endif %}<a href="/logout">Logout</a></div></header>
+<div class="page">
+<div class="metrics">
+<div class="metric"><b class="cyan">{{gate_total}}</b><span>Total gates</span></div>
+<div class="metric"><b class="good">{{gate_open}}</b><span>Open / opening</span></div>
+<div class="metric"><b>{{gate_closed}}</b><span>Closed / closing</span></div>
+<div class="metric"><b class="warn">{{gate_manual}}</b><span>Manual holds</span></div>
+<div class="metric"><b class="bad">{{gate_unavailable}}</b><span>Broken / maintenance</span></div>
+<div class="metric"><b>{{audit_rows|length}}</b><span>Recent override audit</span></div>
+</div>
+<div class="note"><b>Level 3 behaviour:</b> OPEN/CLOSE creates a persistent manual hold. AUTO returns the component to PARKMIND policy. If the selected gate is the active entry alias, PARKMIND first transfers the entry role to another healthy perimeter gate before closing it. The final usable perimeter entrance is never allowed to close.</div>
+<div class="toolbar" style="margin-top:10px"><input id="searchBox" placeholder="Search component / zone..." oninput="applyFilter()"><select id="typeFilter" onchange="applyFilter()"><option value="all">All components</option><option value="gate">Gates</option><option value="fan">Fans</option><option value="light">Lights</option></select><select id="zoneFilter" onchange="applyFilter()"><option value="all">All zones</option>{% for z in all_zones %}<option value="{{z}}">{{z}}</option>{% endfor %}</select></div>
+
+<div class="card control-section" data-type="gate"><div class="section-head"><h2>🚧 Gate Overrides</h2><div><form method="post" action="/control/bulk/gate/open"><input type="hidden" name="scope" value="ALL"><button class="bulk">OPEN ALL HEALTHY</button></form><form method="post" action="/control/bulk/gate/close"><input type="hidden" name="scope" value="ALL"><button class="closebtn">CLOSE ALL SAFE</button></form><form method="post" action="/control/bulk/gate/auto"><input type="hidden" name="scope" value="ALL"><button class="autobtn">AUTO ALL</button></form></div></div>
+{% for group in gate_groups %}<div class="group component-group" data-type="gate" data-zone="{{group.zone}}"><div class="group-head"><div><b>{{group.zone}}</b><div class="mini">{{group.rows|length}} gate(s) · {{group.open_count}} open · {{group.manual_count}} manual</div></div><div><form method="post" action="/control/bulk/gate/open"><input type="hidden" name="scope" value="{{group.zone}}"><button class="openbtn">Open group</button></form><form method="post" action="/control/bulk/gate/close"><input type="hidden" name="scope" value="{{group.zone}}"><button class="closebtn">Close group safe</button></form><form method="post" action="/control/bulk/gate/auto"><input type="hidden" name="scope" value="{{group.zone}}"><button class="autobtn">Auto group</button></form></div></div><div class="grid">
+{% for g in group.rows %}<div class="component filter-item" data-type="gate" data-zone="{{g.zone}}" data-search="{{g.name}} {{g.zone}} {{g.state}} {{g.override}}"><div class="row"><div><div class="name">{{g.name}}</div><div class="mini">{{g.zone}} · health {{g.health}}% · uses {{g.uses}}</div></div><div style="text-align:right"><span class="badge {{'open' if g.state in ['Open','Opening'] else 'closed'}}">{{g.state}}</span><span class="badge {{'manual' if g.override!='AUTO' else 'auto'}}">{{g.override}}</span>{% if g.entry_alias %}<span class="badge">ENTRY</span>{% endif %}{% if g.exit_alias %}<span class="badge">EXIT</span>{% endif %}{% if g.broken %}<span class="badge bad">BROKEN</span>{% endif %}{% if g.maintenance %}<span class="badge warn">MAINT</span>{% endif %}</div></div><div class="controls"><form method="post" action="/control/gate/{{g.name}}/open"><button class="openbtn">↑ OPEN + HOLD</button></form><form method="post" action="/control/gate/{{g.name}}/close"><button class="closebtn">↓ CLOSE + HOLD</button></form><form method="post" action="/control/gate/{{g.name}}/auto"><button class="autobtn">AUTO</button></form></div></div>{% endfor %}
+</div></div>{% endfor %}</div>
+
+<div class="card control-section" data-type="fan"><div class="section-head"><h2>🌀 Exhaust Fan Overrides</h2><div><form method="post" action="/control/bulk/fan/on"><input type="hidden" name="scope" value="ALL"><button class="openbtn">ALL ON</button></form><form method="post" action="/control/bulk/fan/off"><input type="hidden" name="scope" value="ALL"><button class="closebtn">ALL OFF SAFE</button></form><form method="post" action="/control/bulk/fan/auto"><input type="hidden" name="scope" value="ALL"><button class="autobtn">AUTO ALL</button></form></div></div><div class="grid">{% for f in fan_rows %}<div class="component filter-item" data-type="fan" data-zone="{{f.zone}}" data-search="{{f.name}} {{f.zone}} {{f.override}}"><div class="row"><div><div class="name">{{f.name}}</div><div class="mini">{{f.zone}} · CO risk {{f.risk}} · health {{f.health}}%</div></div><div><span class="badge {{'open' if f.on else 'closed'}}">{{'ON' if f.on else 'OFF'}}</span><span class="badge {{'manual' if f.override!='AUTO' else 'auto'}}">{{f.override}}</span></div></div><div class="controls"><form method="post" action="/control/fan/{{f.name}}/on"><button class="openbtn">ON + HOLD</button></form><form method="post" action="/control/fan/{{f.name}}/off"><button class="closebtn">OFF + HOLD</button></form><form method="post" action="/control/fan/{{f.name}}/auto"><button class="autobtn">AUTO</button></form></div></div>{% endfor %}</div></div>
+
+<div class="card control-section" data-type="light"><div class="section-head"><h2>💡 Light Overrides</h2><div><form method="post" action="/control/bulk/light/on"><input type="hidden" name="scope" value="ALL"><button class="openbtn">ALL ON</button></form><form method="post" action="/control/bulk/light/off"><input type="hidden" name="scope" value="ALL"><button class="closebtn">ALL OFF</button></form><form method="post" action="/control/bulk/light/auto"><input type="hidden" name="scope" value="ALL"><button class="autobtn">AUTO ALL</button></form></div></div><div class="grid">{% for l in light_rows %}<div class="component filter-item" data-type="light" data-zone="{{l.zone}}" data-search="{{l.name}} {{l.zone}} {{l.group}} {{l.override}}"><div class="row"><div><div class="name">{{l.name}}</div><div class="mini">{{l.zone}} · group {{l.group}} · health {{l.health}}%</div></div><div><span class="badge {{'open' if l.on else 'closed'}}">{{'ON' if l.on else 'OFF'}}</span><span class="badge {{'manual' if l.override!='AUTO' else 'auto'}}">{{l.override}}</span></div></div><div class="controls"><form method="post" action="/control/light/{{l.name}}/on"><button class="openbtn">ON + HOLD</button></form><form method="post" action="/control/light/{{l.name}}/off"><button class="closebtn">OFF + HOLD</button></form><form method="post" action="/control/light/{{l.name}}/auto"><button class="autobtn">AUTO</button></form></div></div>{% endfor %}</div></div>
+
+<div class="card"><div class="section-head"><h2>🗃 Manual Override Audit · SQLite</h2><span class="mini">Every Control Centre command is stored permanently</span></div><div class="scroll"><table><tr><th>Time</th><th>User</th><th>Component</th><th>Zone</th><th>Action</th><th>Result</th><th>Before</th><th>After</th><th>Detail</th></tr>{% for r in audit_rows %}<tr><td>{{r.created_at}}</td><td>{{r.username}} · {{r.role}}</td><td><b>{{r.component_type}}:{{r.component_name}}</b></td><td>{{r.zone_parent or '-'}}</td><td>{{r.action}}</td><td class="{{'good' if r.result=='SUCCESS' else 'bad'}}">{{r.result}}</td><td>{{r.previous_state}}</td><td>{{r.state_after}}</td><td>{{r.detail}}</td></tr>{% else %}<tr><td colspan="9">No manual commands recorded yet.</td></tr>{% endfor %}</table></div></div>
+</div>
+<script>
+function applyFilter(){const q=(document.getElementById('searchBox').value||'').toLowerCase();const t=document.getElementById('typeFilter').value;const z=document.getElementById('zoneFilter').value;document.querySelectorAll('.filter-item').forEach(el=>{const okQ=!q||(el.dataset.search||'').toLowerCase().includes(q);const okT=t==='all'||el.dataset.type===t;const okZ=z==='all'||el.dataset.zone===z;el.classList.toggle('hiddenByFilter',!(okQ&&okT&&okZ));});document.querySelectorAll('.control-section').forEach(el=>el.style.display=(t==='all'||el.dataset.type===t)?'block':'none');}
+</script>
+</body></html>
+"""
 
 
 SECURITY_HTML = """
@@ -6439,7 +6622,7 @@ def admin_database_status():
         "events", "cars", "decisions", "spot_stats", "anomalies", "fraud_log",
         "penalties", "alerts", "network_security_log", "runtime_state",
         "runtime_state_history", "component_state", "component_state_history",
-        "controller_queue_state", "persistence_log"
+        "controller_queue_state", "persistence_log", "manual_override_log"
     ]
     counts = {}
     for table in tables:
@@ -6461,7 +6644,7 @@ def admin_database_status():
     html = """
     <!doctype html><title>PARKMIND Database</title>
     <style>body{font-family:Segoe UI,Arial;background:#0f172a;color:#e5e7eb;padding:24px}a{color:#38bdf8}table{border-collapse:collapse;width:100%;margin:16px 0;background:#111827}th,td{border:1px solid #334155;padding:9px;text-align:left}th{background:#1e293b}.card{background:#1e293b;padding:16px;border-radius:14px;margin:12px 0}</style>
-    <p><a href="/">← Dashboard</a> &nbsp; <a href="/admin/security">Security</a></p>
+    <p><a href="/">← Dashboard</a> &nbsp; <a href="/control">Control Centre</a> &nbsp; <a href="/admin/security">Security</a></p>
     <h1>Database Persistence Status</h1>
     <div class="card"><b>Latest checkpoint:</b>
     {% if latest %}{{latest['saved_at']}} — {{latest['reason']}} — {{latest['component_count']}} component rows — {{latest['queue_item_count']}} queued items<br><small>{{latest['state_hash']}}</small>{% else %}No checkpoint yet{% endif %}
@@ -6558,6 +6741,281 @@ def search_logs():
         decisions=decisions,
         events=events
     )
+
+
+def _control_role_allowed():
+    return bool(session.get("user")) and session.get("role") in {"Admin", "Operator", "Maintenance"}
+
+
+def _override_label(kind, name):
+    with state_lock:
+        value = manual_overrides.get(kind, {}).get(name)
+    if value is True:
+        return "OPEN" if kind == "gate" else "ON"
+    if value is False:
+        return "CLOSED" if kind == "gate" else "OFF"
+    return "AUTO"
+
+
+def _restore_override(kind, name, previous):
+    with state_lock:
+        bucket = manual_overrides.setdefault(kind, {})
+        if previous is None:
+            bucket.pop(name, None)
+        else:
+            bucket[name] = previous
+        if kind == "gate":
+            if previous is False:
+                manual_gate_closed.add(name)
+            else:
+                manual_gate_closed.discard(name)
+
+
+def control_gate_action(name, action):
+    """Level-3 manual gate command with perimeter-entry failover before CLOSE."""
+    global ENTRY_GATE
+    name = str(name or "").strip()
+    action = str(action or "").strip().lower()
+    if name not in gates:
+        return False, "Unknown gate in live discovery cache."
+    if action not in {"open", "close", "auto"}:
+        return False, "Invalid gate action."
+
+    previous_override = gate_manual_override(name)
+    previous_state = f"state={gates[name].get('state','?')};override={_override_label('gate', name)}"
+
+    if action == "auto":
+        with state_lock:
+            manual_overrides["gate"].pop(name, None)
+            manual_gate_closed.discard(name)
+        refresh_gate_failover_aliases(f"manual AUTO for {name}")
+        ensure_keep_open_gates()
+        return True, f"{name} returned to AUTO control."
+
+    if not gate_safe(name):
+        return False, f"{name} is broken or under maintenance; movement command blocked."
+
+    if action == "open":
+        with state_lock:
+            manual_overrides["gate"][name] = True
+            manual_gate_closed.discard(name)
+        try:
+            if str(gates[name].get("state") or "") not in ("Open", "Opening"):
+                if not open_gate(name, manual=True):
+                    raise RuntimeError("open command was blocked")
+            refresh_gate_failover_aliases(f"manual OPEN for {name}")
+            return True, f"{name} is MANUAL OPEN; automation cannot close it until AUTO/CLOSE."
+        except Exception as exc:
+            _restore_override("gate", name, previous_override)
+            refresh_gate_failover_aliases(f"rollback manual OPEN for {name}")
+            return False, f"Could not open {name}: {exc}"
+
+    # CLOSE: if this is the current entry alias, transfer that role first.
+    if name == ENTRY_GATE:
+        alternatives = [g for g in available_route_gates(perimeter_gates) if g != name]
+        if not alternatives:
+            return False, f"{name} is the last usable perimeter entrance; CLOSE blocked to preserve car spawning."
+
+    with state_lock:
+        manual_overrides["gate"][name] = False
+        manual_gate_closed.add(name)
+
+    if name == ENTRY_GATE:
+        refresh_gate_failover_aliases(f"manual close requested for active entry alias {name}")
+        if name == ENTRY_GATE:
+            _restore_override("gate", name, previous_override)
+            return False, f"No alternative entry alias could be established; {name} remains available."
+
+    try:
+        if str(gates[name].get("state") or "") not in ("Closed", "Closing"):
+            if not close_gate(name, force=True, manual=True):
+                raise RuntimeError("close command was blocked")
+        refresh_gate_failover_aliases(f"manual CLOSED for {name}")
+        return True, f"{name} is MANUAL CLOSED; automation will route around it until AUTO/OPEN."
+    except Exception as exc:
+        _restore_override("gate", name, previous_override)
+        refresh_gate_failover_aliases(f"rollback manual CLOSE for {name}")
+        return False, f"Could not close {name}: {exc}"
+
+
+def control_fan_action(name, action):
+    name = str(name or "").strip()
+    action = str(action or "").strip().lower()
+    if name not in fans:
+        return False, "Unknown fan in live discovery cache."
+    if action not in {"on", "off", "auto"}:
+        return False, "Invalid fan action."
+    previous = manual_overrides["fan"].get(name)
+    if action == "auto":
+        with state_lock:
+            manual_overrides["fan"].pop(name, None)
+        apply_co_policy(str(fans[name].get("zoneParent") or ""))
+        return True, f"{name} returned to automatic CO control."
+    if fans[name].get("broken") or fans[name].get("isUnderMaintenance"):
+        return False, f"{name} is broken or under maintenance."
+    zone = str(fans[name].get("zoneParent") or "")
+    risk = str(zones.get(zone, {}).get("risk") or "").strip().lower()
+    if action == "off" and risk and risk not in {"safe", "low", "normal", "ok"}:
+        return False, f"Manual OFF blocked: {zone} CO risk is {zones.get(zone, {}).get('risk')}; ventilation must remain available."
+    desired = action == "on"
+    with state_lock:
+        manual_overrides["fan"][name] = desired
+    try:
+        if bool(fans[name].get("isOn")) != desired:
+            if not set_fan(name, desired, "Level-3 Control Centre manual override"):
+                raise RuntimeError("fan command was blocked")
+        return True, f"{name} is MANUAL {'ON' if desired else 'OFF'}."
+    except Exception as exc:
+        _restore_override("fan", name, previous)
+        return False, f"Fan command failed: {exc}"
+
+
+def control_light_action(name, action):
+    name = str(name or "").strip()
+    action = str(action or "").strip().lower()
+    if name not in lights:
+        return False, "Unknown light in live discovery cache."
+    if action not in {"on", "off", "auto"}:
+        return False, "Invalid light action."
+    previous = manual_overrides["light"].get(name)
+    if action == "auto":
+        with state_lock:
+            manual_overrides["light"].pop(name, None)
+        apply_light_policy()
+        return True, f"{name} returned to automatic day/night control."
+    if lights[name].get("broken") or lights[name].get("isUnderMaintenance"):
+        return False, f"{name} is broken or under maintenance."
+    desired = action == "on"
+    with state_lock:
+        manual_overrides["light"][name] = desired
+    try:
+        if bool(lights[name].get("isOn")) != desired:
+            if not set_light(name, desired, "Level-3 Control Centre manual override"):
+                raise RuntimeError("light command was blocked")
+        return True, f"{name} is MANUAL {'ON' if desired else 'OFF'}."
+    except Exception as exc:
+        _restore_override("light", name, previous)
+        return False, f"Light command failed: {exc}"
+
+
+def _control_state_text(kind, name):
+    source = {"gate": gates, "fan": fans, "light": lights}.get(kind, {})
+    item = source.get(name, {})
+    if kind == "gate":
+        return f"state={item.get('state','?')};override={_override_label(kind,name)}"
+    return f"state={'ON' if item.get('isOn') else 'OFF'};override={_override_label(kind,name)}"
+
+
+def _control_apply_and_audit(kind, name, action, persist=True):
+    before = _control_state_text(kind, name)
+    handler = {"gate": control_gate_action, "fan": control_fan_action, "light": control_light_action}.get(kind)
+    if not handler:
+        return False, "Unsupported component type."
+    try:
+        success, detail = handler(name, action)
+    except Exception as exc:
+        success, detail = False, f"Unhandled manual-control error: {exc}"
+    after = _control_state_text(kind, name)
+    try:
+        log_manual_override(kind, name, action, before, "SUCCESS" if success else "FAILED", detail, after)
+    except Exception as exc:
+        log_decision("", "MANUAL_AUDIT_FAIL", f"{kind}:{name}:{exc}", detail)
+    if success and persist:
+        checkpoint_manual_override(f"{kind}:{name}:{action}")
+    log_decision("", f"CONTROL_{kind.upper()}_{action.upper()}", f"{name}: {detail}", f"user={session.get('user')} role={session.get('role')}")
+    return success, detail
+
+
+@app.route("/control")
+def control_center():
+    if not _control_role_allowed():
+        return redirect(url_for("login"))
+    with state_lock:
+        gate_rows = []
+        for name, g in sorted(gates.items(), key=lambda kv: (_natural_zone_key(str(kv[1].get("zoneParent") or "PERIMETER")), _natural_zone_key(kv[0]))):
+            zone = str(g.get("zoneParent") or "") or "PERIMETER"
+            gate_rows.append({
+                "name": name, "zone": zone, "state": str(g.get("state") or "Unknown"),
+                "broken": bool(g.get("broken") or name in alarms),
+                "maintenance": bool(g.get("isUnderMaintenance")),
+                "health": component_health_score(name, "gate"),
+                "uses": int(g.get("usage_count") or 0),
+                "override": _override_label("gate", name),
+                "entry_alias": name == ENTRY_GATE, "exit_alias": name == EXIT_GATE,
+            })
+        fan_rows = []
+        for name, f in sorted(fans.items(), key=lambda kv: (_natural_zone_key(str(kv[1].get("zoneParent") or "")), _natural_zone_key(kv[0]))):
+            zone = str(f.get("zoneParent") or "") or "UNASSIGNED"
+            fan_rows.append({"name": name, "zone": zone, "on": bool(f.get("isOn")),
+                             "broken": bool(f.get("broken") or name in alarms), "maintenance": bool(f.get("isUnderMaintenance")),
+                             "health": component_health_score(name, "fan"), "override": _override_label("fan", name),
+                             "risk": str(zones.get(zone, {}).get("risk") or "Unknown")})
+        light_rows = []
+        for name, l in sorted(lights.items(), key=lambda kv: (_natural_zone_key(str(kv[1].get("zoneParent") or "")), _natural_zone_key(kv[0]))):
+            zone = str(l.get("zoneParent") or "") or "UNASSIGNED"
+            light_rows.append({"name": name, "zone": zone, "group": str(l.get("group") or "-"), "on": bool(l.get("isOn")),
+                               "broken": bool(l.get("broken") or name in alarms), "maintenance": bool(l.get("isUnderMaintenance")),
+                               "health": component_health_score(name, "light"), "override": _override_label("light", name)})
+
+    gate_groups = []
+    for zone in sorted({r["zone"] for r in gate_rows}, key=_natural_zone_key):
+        rows = [r for r in gate_rows if r["zone"] == zone]
+        gate_groups.append({"zone": zone, "rows": rows,
+                            "open_count": sum(1 for r in rows if r["state"] in ("Open", "Opening")),
+                            "manual_count": sum(1 for r in rows if r["override"] != "AUTO")})
+
+    conn = db()
+    try:
+        audit_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM manual_override_log ORDER BY id DESC LIMIT 100"
+        ).fetchall()]
+    finally:
+        conn.close()
+
+    all_zones = sorted({r["zone"] for r in gate_rows + fan_rows + light_rows}, key=_natural_zone_key)
+    return render_template_string(
+        CONTROL_HTML, user=session.get("user"), role=session.get("role"), is_admin=session.get("role") == "Admin",
+        gate_rows=gate_rows, fan_rows=fan_rows, light_rows=light_rows, gate_groups=gate_groups,
+        all_zones=all_zones, audit_rows=audit_rows, gate_total=len(gate_rows),
+        gate_open=sum(1 for r in gate_rows if r["state"] in ("Open", "Opening")),
+        gate_closed=sum(1 for r in gate_rows if r["state"] in ("Closed", "Closing")),
+        gate_manual=sum(1 for r in gate_rows if r["override"] != "AUTO"),
+        gate_unavailable=sum(1 for r in gate_rows if r["broken"] or r["maintenance"]),
+    )
+
+
+@app.route("/control/<kind>/<name>/<action>", methods=["POST"])
+def control_component(kind, name, action):
+    if not _control_role_allowed():
+        return redirect(url_for("login"))
+    kind = str(kind or "").lower()
+    _control_apply_and_audit(kind, name, action)
+    return redirect(url_for("control_center"))
+
+
+@app.route("/control/bulk/<kind>/<action>", methods=["POST"])
+def control_bulk(kind, action):
+    if not _control_role_allowed():
+        return redirect(url_for("login"))
+    kind = str(kind or "").lower()
+    action = str(action or "").lower()
+    scope = str(request.form.get("scope") or "ALL").strip()
+    source = {"gate": gates, "fan": fans, "light": lights}.get(kind)
+    allowed = {"gate": {"open", "close", "auto"}, "fan": {"on", "off", "auto"}, "light": {"on", "off", "auto"}}
+    if source is None or action not in allowed.get(kind, set()):
+        return ("Invalid bulk manual-control request", 400)
+
+    with state_lock:
+        names = [n for n, item in source.items() if scope == "ALL" or (str(item.get("zoneParent") or "") or ("PERIMETER" if kind == "gate" else "UNASSIGNED")) == scope]
+    successes = 0
+    failures = 0
+    for name in names:
+        ok, _ = _control_apply_and_audit(kind, name, action, persist=False)
+        successes += 1 if ok else 0
+        failures += 0 if ok else 1
+    log_decision("", "CONTROL_BULK", f"{kind}:{action} scope={scope} success={successes} failed={failures}", f"user={session.get('user')}")
+    checkpoint_manual_override(f"bulk:{kind}:{action}:{scope}")
+    return redirect(url_for("control_center"))
 
 
 @app.route("/sync", methods=["POST"])
@@ -10299,6 +10757,10 @@ def _build_maintenance_blueprint():
 
         if success:
 
+            with state_lock:
+                manual_overrides["fan"][name] = (action == "on")
+            checkpoint_manual_override(f"maintenance-fan:{name}:{action}")
+
             flash(
                 f"🌀 {detail}"
             )
@@ -10374,6 +10836,10 @@ def _build_maintenance_blueprint():
 
         if success:
 
+            with state_lock:
+                manual_overrides["light"][name] = (action == "on")
+            checkpoint_manual_override(f"maintenance-light:{name}:{action}")
+
             flash(
                 f"💡 {detail}"
             )
@@ -10448,6 +10914,8 @@ def _build_maintenance_blueprint():
 
 
         if success:
+
+            checkpoint_manual_override(f"maintenance-gate:{name}:{action}")
 
             flash(
                 f"🚧 {detail}"
@@ -11302,12 +11770,13 @@ if __name__ == "__main__":
         print("[STARTUP] Start the simulator; PARKMIND will safely sync on the first arrival.")
 
     print("\n============================================")
-    print("  PARKMIND v3.5 — LEVEL 3 Airport Full-Database + Burst-Optimized Edition")
+    print("  PARKMIND v3.7 — LEVEL 3 Airport API-Safe Entry Routing + Full-Database Edition")
     print("  Team: Pretty Little Hackers")
     print("  Dashboard: http://127.0.0.1:8000")
     print("  Webhook:   http://127.0.0.1:8000/webhook")
     print("  Login:     admin/admin · operator/operator · maintenance/maintenance")
     print("  Maintenance: http://127.0.0.1:8000/maintenance/")
+    print("  Control:     http://127.0.0.1:8000/control")
     print("  API-derived entry alias:", ENTRY_GATE, "(derived from /list-barriers)")
     print("  API-derived exit alias: ", EXIT_GATE, "(derived from /list-barriers)")
     print("  Entry control: ZONE-SPILLOVER (busy first zone -> next zone; no internal pile-up)")
