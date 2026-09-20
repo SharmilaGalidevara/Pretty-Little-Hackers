@@ -36,7 +36,7 @@
 #       preview; judges see we're thinking ahead.
 # =====================================================================
 
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, Response
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, Response, flash
 import requests
 import sqlite3
 import threading
@@ -219,7 +219,8 @@ stats = {
     "total_penalties": 0,
     "fraud_attempts_blocked": 0,
     "webhooks_verified": 0,
-    "webhooks_unsigned_accepted": 0,
+    "webhooks_unsigned_accepted": 0,  # legacy counter retained for compatibility
+    "webhooks_unsigned_rejected": 0,
     "webhooks_rejected_sig": 0,
     "sequence_gaps_detected": 0,
     "auto_recoveries": 0,
@@ -317,6 +318,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS penalties (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         detected_at TEXT,
+        event_time TEXT,
+        plate TEXT,
         reason TEXT,
         fine_amount REAL,
         payload TEXT
@@ -343,6 +346,49 @@ def init_db():
         payment_status TEXT,
         car_status TEXT
     );
+
+    -- Level-2 security/audit additions are deliberately separate tables so
+    -- they cannot disturb the working vehicle/payment schema.
+    CREATE TABLE IF NOT EXISTS login_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        attempted_at TEXT,
+        username TEXT,
+        success INTEGER DEFAULT 0,
+        role TEXT,
+        ip TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS unsigned_webhooks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        received_at TEXT,
+        event_id TEXT,
+        sequence_id INTEGER,
+        event_class TEXT,
+        payload TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT,
+        actor TEXT,
+        role TEXT,
+        action TEXT,
+        target TEXT,
+        detail TEXT,
+        result TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS manual_recoveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT,
+        actor TEXT,
+        plate TEXT,
+        car_type TEXT,
+        spot TEXT,
+        estimated_minutes INTEGER,
+        recovery_state TEXT,
+        detail TEXT
+    );
     """)
     # Safe migration for an existing parkmind_v2.db created by an older build.
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(cars)").fetchall()}
@@ -360,6 +406,12 @@ def init_db():
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE cars ADD COLUMN {col} {ddl}")
 
+    penalty_cols = {row[1] for row in conn.execute("PRAGMA table_info(penalties)").fetchall()}
+    if "event_time" not in penalty_cols:
+        conn.execute("ALTER TABLE penalties ADD COLUMN event_time TEXT")
+    if "plate" not in penalty_cols:
+        conn.execute("ALTER TABLE penalties ADD COLUMN plate TEXT")
+
     alert_cols = {row[1] for row in conn.execute("PRAGMA table_info(alerts)").fetchall()}
     if "stay_seconds" not in alert_cols:
         conn.execute("ALTER TABLE alerts ADD COLUMN stay_seconds INTEGER DEFAULT 0")
@@ -370,6 +422,77 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+def record_login_attempt(username, success, role=""):
+    """Persist every successful/failed login without ever blocking authentication."""
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
+    conn = None
+    try:
+        conn = db()
+        conn.execute(
+            "INSERT INTO login_attempts(attempted_at,username,success,role,ip) VALUES(?,?,?,?,?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(username or ""), 1 if success else 0, str(role or ""), ip)
+        )
+        conn.commit()
+    except Exception as e:
+        print("[LOGIN AUDIT]", e)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def recent_login_attempts(limit=3):
+    conn = db()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT attempted_at,username,success,role,ip FROM login_attempts ORDER BY id DESC LIMIT ?",
+            (max(1, int(limit)),)
+        ).fetchall()]
+    except Exception:
+        rows = []
+    conn.close()
+    return rows
+
+
+def log_unsigned_webhook(data):
+    """Store unsigned Level-2 calls for security review; never passes them to handle_event."""
+    conn = db()
+    conn.execute(
+        """INSERT INTO unsigned_webhooks(received_at,event_id,sequence_id,event_class,payload)
+           VALUES(?,?,?,?,?)""",
+        (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            str(data.get("EventId") or ""), data.get("SequenceId"),
+            str(data.get("EventClass") or ""), json.dumps(data)
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def log_audit(action, target="", detail="", result="SUCCESS", actor=None, role=None):
+    """Level-2 actor-aware audit record. Audit failure must never stop parking control."""
+    if actor is None:
+        try:
+            actor = session.get("user") or "SYSTEM"
+            role = role or session.get("role") or "SYSTEM"
+        except RuntimeError:
+            actor, role = "SYSTEM", (role or "SYSTEM")
+    conn = None
+    try:
+        conn = db()
+        conn.execute(
+            "INSERT INTO audit_log(created_at,actor,role,action,target,detail,result) VALUES(?,?,?,?,?,?,?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(actor), str(role or ""),
+             str(action), str(target or ""), str(detail or ""), str(result or ""))
+        )
+        conn.commit()
+    except Exception as e:
+        print("[AUDIT]", e)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def seconds_between(start_text, end_text):
@@ -438,15 +561,19 @@ def log_fraud(plate, reason, attempted_amount):
     print(f"[FRAUD BLOCKED] {plate or '-'} | {reason} | amount={attempted_amount}")
 
 
-def log_penalty(reason, fine_amount, payload=None):
+def log_penalty(reason, fine_amount, payload=None, plate=""):
+    payload = payload or {}
     conn = db()
     conn.execute(
-        "INSERT INTO penalties(detected_at, reason, fine_amount, payload) VALUES(?,?,?,?)",
+        """INSERT INTO penalties(detected_at, event_time, plate, reason, fine_amount, payload)
+           VALUES(?,?,?,?,?,?)""",
         (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            str(payload.get("ServerDateTime") or ""),
+            str(plate or payload.get("CarPlateNumber") or payload.get("PlateNumber") or ""),
             str(reason or ""),
             float(fine_amount or 0),
-            json.dumps(payload or {})
+            json.dumps(payload)
         )
     )
     conn.commit()
@@ -944,9 +1071,8 @@ def verify_webhook_signature(data: dict):
       False -> a non-empty signature was present but DID NOT match.
       None  -> simulator sent no usable signature (e.g. Signature=None).
 
-    Level 1 commonly sends Signature=None, so those events must remain usable.
-    We accept them as UNSIGNED and record that fact rather than falsely claiming
-    they were verified.
+    Level 2 requires signed webhooks. Missing signatures are returned as None
+    so the endpoint can log and reject them without altering controller state.
     """
     raw_sig = data.get("Signature")
 
@@ -2184,28 +2310,52 @@ def _natural_zone_key(name):
 
 
 def choose_spot(car_type, planned_minutes, avoid_busy_zone_gates=False):
-    """Choose a safe compatible bay from API-discovered zones.
+    """Choose a safe compatible bay while balancing cars across zones.
 
-    Entry policy:
-      * Prefer zones in natural API-discovered order.
-      * If Zone 1 currently has one car occupying/waiting on its gate path,
-        immediately spill the next car to Zone 2.
-      * If Zone 1 and Zone 2 are busy, spill to Zone 3, and so on.
-      * A busy zone is skipped only for the gate crossing; we do NOT wait for
-        the previous car to finish parking before that zone becomes eligible again.
+    LEVEL-2 ADMISSION POLICY:
+      * Only healthy, free, compatible and unreserved spots are candidates.
+      * Prefer the zone with the FEWEST cars already committed to it.
+        A committed car means either physically occupied or currently reserved /
+        in transit to a bay.  Natural zone order breaks ties.
+      * Example with Zone1/Zone2/Zone3 counts:
+          0/0/0 -> Zone1
+          1/0/0 -> Zone2
+          1/1/0 -> Zone3
+          1/1/1 -> Zone1
+      * If a zone gate path is currently busy, skip that zone for this admission
+        so a second car is never stacked behind the same internal barrier.
+      * Unzoned spots remain a last-resort fallback only.
 
-    Non-entry recovery callers can leave avoid_busy_zone_gates=False so normal
-    safe spot recovery is not blocked by the admission traffic policy.
+    This changes ONLY destination selection.  The existing reservation, gate,
+    dispatch, payment and exit state machines remain unchanged.
     """
+
+    def committed_count(zone_name):
+        """Cars already occupying or reserved/in-transit to this zone."""
+        total = 0
+        for spot_name, spot in spots.items():
+            if str(spot.get("zoneParent") or "") != zone_name:
+                continue
+            if spot.get("occupied"):
+                total += 1
+            elif spot_name in reserved_spots:
+                total += 1
+        return total
+
     zone_names = sorted(
-        {str(s.get("zoneParent") or "") for s in spots.values() if str(s.get("zoneParent") or "")},
+        {
+            str(s.get("zoneParent") or "")
+            for s in spots.values()
+            if str(s.get("zoneParent") or "")
+        },
         key=_natural_zone_key,
     )
-    # Keep unzoned spots as a last fallback if a future level exposes them.
-    zone_names.append("")
 
+    usable_zones = []
     busy_zones_with_capacity = []
 
+    # Build safe/compatible candidates per zone first.  We intentionally do not
+    # pick Zone1 merely because it appears first; zone occupancy decides priority.
     for zone_name in zone_names:
         candidates = []
         for name, spot in spots.items():
@@ -2215,6 +2365,7 @@ def choose_spot(car_type, planned_minutes, avoid_busy_zone_gates=False):
                 continue
             if name in reserved_spots:
                 continue
+
             score, reason = smart_spot_score(name, spot, car_type, planned_minutes)
             if score < 0:
                 continue
@@ -2223,22 +2374,47 @@ def choose_spot(car_type, planned_minutes, avoid_busy_zone_gates=False):
         if not candidates:
             continue
 
-        # Admission spillover: one active/waiting car per zone-gate path.
-        # Do not queue a second car behind it; try the next API-discovered zone.
-        if avoid_busy_zone_gates and zone_name and zone_crossing_busy(zone_name):
+        if avoid_busy_zone_gates and zone_crossing_busy(zone_name):
             busy_zones_with_capacity.append(zone_name)
             continue
 
         candidates.sort(key=lambda x: (-x[0], natural_spot_key(x[1]), x[1]))
+        usable_zones.append((committed_count(zone_name), _natural_zone_key(zone_name), zone_name, candidates))
+
+    if usable_zones:
+        # Lowest committed-car count wins.  Ties go Zone1 -> Zone2 -> Zone3 ...
+        usable_zones.sort(key=lambda x: (x[0], x[1]))
+        committed, _, zone_name, candidates = usable_zones[0]
         best = candidates[0]
-        priority = zone_name or "UNZONED"
         spill = ""
         if busy_zones_with_capacity:
             spill = f"SPILLED_PAST_BUSY={','.join(busy_zones_with_capacity)} | "
-        return best[1], f"{spill}ZONE_PRIORITY={priority} | {best[2]}"
+        return (
+            best[1],
+            f"{spill}ZONE_BALANCE_COUNT={committed} | ZONE_PRIORITY={zone_name} | {best[2]}"
+        )
+
+    # Keep unzoned spots strictly as a last fallback for future simulator levels.
+    unzoned_candidates = []
+    for name, spot in spots.items():
+        if str(spot.get("zoneParent") or ""):
+            continue
+        if spot.get("occupied") or spot.get("broken") or spot.get("isUnderMaintenance"):
+            continue
+        if name in reserved_spots:
+            continue
+        score, reason = smart_spot_score(name, spot, car_type, planned_minutes)
+        if score >= 0:
+            unzoned_candidates.append((score, name, reason))
+
+    if unzoned_candidates:
+        unzoned_candidates.sort(key=lambda x: (-x[0], natural_spot_key(x[1]), x[1]))
+        best = unzoned_candidates[0]
+        return best[1], f"ZONE_PRIORITY=UNZONED | {best[2]}"
 
     if avoid_busy_zone_gates and busy_zones_with_capacity:
         return None, f"WAIT_ALL_ZONE_GATES_BUSY={','.join(busy_zones_with_capacity)}"
+
     return None, ""
 
 
@@ -3638,6 +3814,14 @@ def handle_event(data):
                         log_anomaly(plate, "EXIT_INTERLOCK_BREACH",
                                     f"Unexpected second car reached ExitSpot {spot_name} while {exit_lane_plate} owns exit lane")
                 car_before_exit = get_car(plate) or {}
+                manual_spot = car_before_exit.get("actual_spot") or car_before_exit.get("assigned_spot") or ""
+                if str(car_before_exit.get("operator_note") or "").startswith("[MANUAL RECOVERY]") and manual_spot:
+                    with state_lock:
+                        if manual_spot in spots:
+                            spots[manual_spot]["occupied"] = False
+                        reserved_spots.pop(manual_spot, None)
+                    log_decision(plate, "MANUAL_RECOVERY_SPOT_RELEASED", manual_spot,
+                                 "ExitSpot arrival confirms the manually recovered vehicle has physically left its bay.")
                 source_zone = _component_zone(
                     car_before_exit.get("actual_spot") or car_before_exit.get("assigned_spot") or ""
                 )
@@ -3935,7 +4119,7 @@ def handle_event(data):
                     departure_time=(car or {}).get("departure_time") or penalty_time
                 )
 
-            log_penalty(reason, fine, data)
+            log_penalty(reason, fine, data, penalty_plate)
             record_alert(
                 alert_key=f"PENALTY:{data.get('EventId') or data.get('SequenceId') or datetime.now().timestamp()}",
                 alert_type="PENALTY",
@@ -4005,29 +4189,38 @@ def webhook():
     data = request.get_json(silent=True) or {}
     print("\n[WEBHOOK]", data)
 
-    # Signature integrity handling:
-    #   True  = verified
-    #   None  = unsigned (accepted for Level 1, clearly labelled)
-    #   False = signature mismatch (rejected)
+    # LEVEL-2 SECURITY INVARIANT:
+    # only correctly signed calls are allowed to reach handle_event().
     sig_result = verify_webhook_signature(data)
+
+    if sig_result is None:
+        with state_lock:
+            stats["webhooks_unsigned_rejected"] += 1
+        try:
+            log_unsigned_webhook(data)
+        except Exception as e:
+            print("[WEBHOOK] unsigned log failure:", e)
+        log_decision("", "WEBHOOK_UNSIGNED_REJECTED",
+                     f"event={data.get('EventClass')} seq={data.get('SequenceId')}",
+                     "Level 2 accepts only signed webhooks; event was logged but NOT acted on.")
+        log_audit("WEBHOOK_UNSIGNED_REJECTED", str(data.get("EventClass") or ""),
+                  f"seq={data.get('SequenceId')}", "REJECTED", actor="SYSTEM", role="SYSTEM")
+        return jsonify({"status": "unsigned_logged_rejected"}), 403
 
     if sig_result is False:
         with state_lock:
             stats["webhooks_rejected_sig"] += 1
         log_decision("", "WEBHOOK_REJECTED", "Signature mismatch",
                      "Integrity check failed; event was not acted on.")
-        return jsonify({"status": "signature_invalid"}), 200
+        log_audit("WEBHOOK_SIGNATURE_REJECTED", str(data.get("EventClass") or ""),
+                  f"seq={data.get('SequenceId')}", "REJECTED", actor="SYSTEM", role="SYSTEM")
+        return jsonify({"status": "signature_invalid"}), 403
 
-    if sig_result is True:
-        with state_lock:
-            stats["webhooks_verified"] += 1
-        signature_label = "verified"
-    else:
-        with state_lock:
-            stats["webhooks_unsigned_accepted"] += 1
-        signature_label = "unsigned_level1"
+    with state_lock:
+        stats["webhooks_verified"] += 1
+    signature_label = "verified"
 
-    # Sequence gap detection still works for both signed and unsigned events.
+    # Sequence monitoring applies only after signature authentication.
     check_sequence_gap(data.get("SequenceId"))
 
     # EventId dedup / idempotency.
@@ -4503,9 +4696,12 @@ button:hover{
     <span class="mini">{{sim_time or 'Simulator time unavailable'}}</span>
     <a href="#live-control">Live Controls</a>
     <a href="/maintenance/">Maintenance</a>
+    <a href="/penalties">Penalties</a>
+    <a href="/reports/daily">Daily Report</a>
     <a href="#critical-alerts">Alerts</a>
     <a href="/export/cars">Export</a>
-    <a href="/search">Search / Audit</a>
+    <a href="/audit">Audit</a>
+    <a href="/search">Search</a>
     <a href="/logout">Logout</a>
 </div>
 
@@ -4513,6 +4709,18 @@ button:hover{
 
 
 <div class="page">
+
+{% if recent_logins %}
+<div class="card" style="margin-bottom:12px;border-color:#365a73">
+<div class="card-head"><h2>Login Security · Last 3 Attempts</h2><span class="badge">LEVEL 2 RBAC</span></div>
+<div class="mini">
+{% for x in recent_logins %}
+<b class="{{'good' if x.success else 'bad'}}">{{'SUCCESS' if x.success else 'FAILED'}}</b>
+{{x.username or '-'}} · {{x.attempted_at}} · {{x.ip or '-'}}{% if not loop.last %}<br>{% endif %}
+{% endfor %}
+</div>
+</div>
+{% endif %}
 
 <div class="live">
     <div>
@@ -5073,6 +5281,24 @@ Costs shown here are only simulator-confirmed
 </div>
 
 <div class="card" style="margin-top:12px">
+<div class="card-head"><h2>Manual / Unregistered Vehicle Recovery</h2><span class="badge">LEVEL 2 EXCEPTION FLOW</span></div>
+<div class="mini" style="margin-bottom:10px">Use only when a real vehicle entered/parked without normal entry or spot events. This creates an audited tracked record so the normal payment-locked exit workflow can be used.</div>
+<form method="post" action="/admin/manual-car/recover" style="display:flex;gap:7px;flex-wrap:wrap;align-items:center">
+<input name="plate" required placeholder="Plate e.g. ABC 123" style="padding:7px;border-radius:7px;border:1px solid #334155;background:#0c1727;color:white">
+<select name="car_type" style="padding:7px;border-radius:7px;background:#0c1727;color:white;border:1px solid #334155">
+<option>Normal</option><option>Electric</option><option>Accessible</option>
+</select>
+<select name="spot" style="padding:7px;border-radius:7px;background:#0c1727;color:white;border:1px solid #334155">
+<option value="">Already at ExitSpot / unknown bay</option>
+{% for sp in spot_rows %}<option value="{{sp.name}}">{{sp.name}} · {{sp.zone}} · {{sp.type}}</option>{% endfor %}
+</select>
+<input name="estimated_minutes" type="number" min="1" max="1440" value="1" required title="Estimated parked duration in minutes" style="width:95px;padding:7px;border-radius:7px;border:1px solid #334155;background:#0c1727;color:white">
+<label class="mini"><input type="checkbox" name="start_exit" value="1" checked> start normal exit flow</label>
+<button class="btn-yellow">Recover Vehicle</button>
+</form>
+</div>
+
+<div class="card" style="margin-top:12px">
 <div class="card-head"><h2>Administrative Actions</h2><span class="badge">EXISTING PARKMIND FUNCTIONS</span></div>
 <div class="admin-tool-row">
 <form method="post" action="/sync"><button>↻ Sync Simulator Topology</button></form>
@@ -5492,8 +5718,10 @@ def _admin_dashboard_context(spot_rows, gate_rows, fan_rows, zone_rows, alerts, 
         "broken": len(broken_names),
         "maintenance_due": len(maintenance_names),
         "events": verified_events,
-        # Existing PARKMIND login flow does not persist a login-attempt table.
-        "failed_logins": 0,
+        "failed_logins": sql_count(
+            "SELECT COUNT(*) FROM login_attempts WHERE success=0 AND substr(attempted_at,1,10)=?",
+            (today_date,)
+        ),
     }
 
     # Existing maintenance dashboard records job lifecycle, not monetary repair cost.
@@ -5565,7 +5793,7 @@ def _admin_dashboard_context(spot_rows, gate_rows, fan_rows, zone_rows, alerts, 
         "operations": operations,
         "maintenance": maintenance,
         "payments": payments,
-        "logins": [],
+        "logins": recent_login_attempts(3),
     }
 
 
@@ -5632,6 +5860,13 @@ summary{cursor:pointer;color:#cbd5e1;font-size:11px;font-weight:700}
 </header>
 
 <div class="page">
+
+{% if recent_logins %}
+<div class="operator-note">
+<b>LOGIN SECURITY · LAST 3 ATTEMPTS</b><br>
+{% for x in recent_logins %}{{'SUCCESS' if x.success else 'FAILED'}} · {{x.username or '-'}} · {{x.attempted_at}} · {{x.ip or '-'}}{% if not loop.last %}<br>{% endif %}{% endfor %}
+</div>
+{% endif %}
 
 {% if role == "Operator" %}
 <div class="operator-note">
@@ -5969,15 +6204,27 @@ def login():
         password = request.form.get("password", "")
         u = USERS.get(username)
         if u and u["password"] == password:
+            record_login_attempt(username, True, u["role"])
+            log_audit("LOGIN", username, f"role={u['role']}", "SUCCESS", actor=username, role=u["role"])
             session.clear()
             session["user"] = username
             session["role"] = u["role"]
+            session["show_login_notice"] = True
 
-            # Maintenance credentials go straight to the maintenance console.
+            # Maintenance already has a flash area; show the required last-three there
+            # without changing its dashboard structure.
             if u["role"] == "Maintenance":
+                items = recent_login_attempts(3)
+                summary = " | ".join(
+                    f"{'SUCCESS' if x['success'] else 'FAILED'} {x['username']} {x['attempted_at']}"
+                    for x in items
+                )
+                flash("Login security · last 3: " + summary)
                 return redirect(url_for("maintenance.dashboard"))
 
             return redirect(url_for("dashboard"))
+        record_login_attempt(username, False, u["role"] if u else "UNKNOWN")
+        log_audit("LOGIN", username, "Invalid credentials", "FAILED", actor=username or "UNKNOWN", role=u["role"] if u else "UNKNOWN")
         error = "Invalid login"
     return render_template_string(LOGIN_HTML, error=error)
 
@@ -5990,10 +6237,15 @@ def operator_login():
         password = request.form.get("password", "")
         u = USERS.get("operator")
         if username == "operator" and u and u["password"] == password:
+            record_login_attempt("operator", True, "Operator")
+            log_audit("LOGIN", "operator", "role=Operator", "SUCCESS", actor="operator", role="Operator")
             session.clear()
             session["user"] = "operator"
             session["role"] = "Operator"
+            session["show_login_notice"] = True
             return redirect(url_for("dashboard"))
+        record_login_attempt(username, False, "Operator")
+        log_audit("LOGIN", username, "Invalid operator credentials", "FAILED", actor=username or "UNKNOWN", role="Operator")
         error = "Invalid operator password"
     return render_template_string(OPERATOR_LOGIN_HTML, error=error)
 
@@ -6011,6 +6263,9 @@ def dashboard():
 
     if session.get("role") == "Maintenance":
         return redirect(url_for("maintenance.dashboard"))
+
+    show_login_notice = bool(session.pop("show_login_notice", False))
+    recent_logins = recent_login_attempts(3) if show_login_notice else []
 
     with state_lock:
         spot_rows = []
@@ -6219,6 +6474,7 @@ def dashboard():
             zone_rows=zone_rows, fan_rows=fan_rows, light_rows=light_rows, alarm_rows=alarm_rows,
             simulator_time=last_simulator_time, last_sync=last_sync_at,
             arrival_bars=arrival_bars, demo=demo_state,
+            recent_logins=recent_logins,
             **admin_ctx
         )
 
@@ -6234,6 +6490,7 @@ def dashboard():
         zone_rows=zone_rows, fan_rows=fan_rows, light_rows=light_rows, alarm_rows=alarm_rows,
         simulator_time=last_simulator_time, last_sync=last_sync_at,
         arrival_bars=arrival_bars,
+        recent_logins=recent_logins,
         is_admin=False,
         demo=demo_state
     )
@@ -6320,6 +6577,7 @@ def sync_route():
     if not require_admin():
         return ("Admin only", 403)
     safe_sync_state("manual")
+    log_audit("SIMULATOR_SYNC", "topology", "Manual topology sync requested", "SUCCESS")
     return redirect(url_for("dashboard"))
 
 
@@ -6361,6 +6619,8 @@ def manual_gate(name, action):
                     "", "MANUAL_ENTRY_CLOSE_BLOCKED", name,
                     "Dashboard close rejected because this barrier is required for simulator arrival spawning."
                 )
+                log_audit("MANUAL_GATE", name, "action=close; spawn-protected entry gate", "DENIED")
+                return redirect(url_for("dashboard"))
             else:
                 with state_lock:
                     manual_overrides["gate"][name] = False
@@ -6373,8 +6633,10 @@ def manual_gate(name, action):
                 )
         else:
             return ("Invalid gate action", 400)
+        log_audit("MANUAL_GATE", name, f"action={action}", "SUCCESS")
     except Exception as e:
         log_decision("", "MANUAL_GATE_ERROR", f"{name}: {e}")
+        log_audit("MANUAL_GATE", name, f"action={action}; error={e}", "FAILED")
     return redirect(url_for("dashboard"))
 
 
@@ -6392,8 +6654,10 @@ def manual_fan(name, action):
             desired = action == "on"
             manual_overrides["fan"][name] = desired
             set_fan(name, desired, "Operator manual override via dashboard")
+        log_audit("MANUAL_FAN", name, f"action={action}", "SUCCESS")
     except Exception as e:
         log_decision("", "MANUAL_FAN_ERROR", f"{name}: {e}")
+        log_audit("MANUAL_FAN", name, f"action={action}; error={e}", "FAILED")
     return redirect(url_for("dashboard"))
 
 
@@ -6411,8 +6675,10 @@ def manual_light(name, action):
             desired = action == "on"
             manual_overrides["light"][name] = desired
             set_light(name, desired, "Operator manual override via dashboard")
+        log_audit("MANUAL_LIGHT", name, f"action={action}", "SUCCESS")
     except Exception as e:
         log_decision("", "MANUAL_LIGHT_ERROR", f"{name}: {e}")
+        log_audit("MANUAL_LIGHT", name, f"action={action}; error={e}", "FAILED")
     return redirect(url_for("dashboard"))
 
 
@@ -6428,8 +6694,10 @@ def manual_light_group(group, action):
             desired = action == "on"
             manual_overrides["light_group"][group] = desired
             set_light_group(group, desired, "Operator manual group override via dashboard")
+        log_audit("MANUAL_LIGHT_GROUP", group, f"action={action}", "SUCCESS")
     except Exception as e:
         log_decision("", "MANUAL_LIGHT_GROUP_ERROR", f"{group}: {e}")
+        log_audit("MANUAL_LIGHT_GROUP", group, f"action={action}; error={e}", "FAILED")
     return redirect(url_for("dashboard"))
 
 
@@ -6437,13 +6705,18 @@ def manual_light_group(group, action):
 def manual_component_repair(kind, name):
     if not require_login():
         return redirect(url_for("login"))
+    if session.get("role") not in ("Admin", "Maintenance"):
+        log_audit("REPAIR_BLOCKED_RBAC", f"{kind}:{name}", "Operator is not authorized to repair components", "DENIED")
+        return ("Maintenance/Admin only", 403)
     source = {"gate": gates, "fan": fans, "spot": spots}.get(kind)
     if source is None or name not in source:
         return ("Unknown/unsupported component from simulator discovery cache", 404)
     try:
         repair_component(name)
+        log_audit("REPAIR_REQUEST", f"{kind}:{name}", "Repair command submitted", "SUCCESS")
     except Exception as e:
         log_decision("", "MANUAL_REPAIR_ERROR", f"{kind}:{name}: {e}")
+        log_audit("REPAIR_REQUEST", f"{kind}:{name}", str(e), "FAILED")
     return redirect(url_for("dashboard"))
 
 
@@ -6452,6 +6725,7 @@ def manual_exit(plate):
     if not require_login():
         return redirect(url_for("login"))
     threading.Thread(target=request_exit_lane, args=(plate,), daemon=True).start()
+    log_audit("MANUAL_EXIT_REQUEST", plate, "Operator/Admin requested normal exit-lane workflow", "REQUESTED")
     return redirect(url_for("dashboard"))
 
 
@@ -6464,6 +6738,7 @@ def reassign_route_hold(plate):
     car = get_car(plate)
     if not car:
         return ("Unknown car", 404)
+    log_audit("MANUAL_REASSIGN_REQUEST", plate, f"status={car.get('status')}", "REQUESTED")
 
     if car.get("status") != "ROUTE_HOLD":
         log_decision(
@@ -6530,6 +6805,7 @@ def retry_payment(plate):
     car = get_car(plate)
     if not car:
         return ("Unknown car", 404)
+    log_audit("PAYMENT_RETRY_REQUEST", plate, f"status={car.get('status')} payment={car.get('payment_status')}", "REQUESTED")
 
     if car.get("status") not in ("AT_EXIT", "PAYMENT_PENDING", "PAYMENT_HOLD") and \
        car.get("payment_status") not in ("INVALID", "CHARGE_ERROR", "WAITING_TO_CHARGE"):
@@ -6642,11 +6918,229 @@ def demo_scenario(scenario):
     return redirect(url_for("dashboard"))
 
 
+# =====================================================================
+# LEVEL-2 COMPLIANCE PAGES / EXCEPTION RECOVERY
+# =====================================================================
+PENALTIES_HTML = """
+<!doctype html><html><head><title>PARKMIND — Penalties</title>
+<style>body{font-family:Segoe UI,Arial;background:#07111f;color:#e5e7eb;margin:0;padding:20px}a{color:#67e8f9}table{width:100%;border-collapse:collapse;background:#101b2d}th,td{padding:9px;border-bottom:1px solid #26364e;text-align:left}th{color:#94a3b8;font-size:11px}.bad{color:#f87171}.mini{font-size:10px;color:#94a3b8}</style></head><body>
+<p><a href="/">← Dashboard</a></p><h1>Simulator Penalties</h1>
+<div class="mini">Every simulator penalty is stored independently of the live dashboard.</div><br>
+<table><tr><th>Time</th><th>Plate</th><th>Reason</th><th>Fine</th></tr>
+{% for p in rows %}<tr><td>{{p.event_time}}</td><td>{{p.plate or '-'}}</td><td>{{p.reason or '-'}}</td><td class="bad">{{'%.2f'|format(p.fine_amount or 0)}}</td></tr>
+{% else %}<tr><td colspan="4">No penalties recorded.</td></tr>{% endfor %}</table></body></html>
+"""
+
+DAILY_REPORT_HTML = """
+<!doctype html><html><head><title>PARKMIND — Daily Report</title>
+<style>body{font-family:Segoe UI,Arial;background:#07111f;color:#e5e7eb;margin:0;padding:20px}a{color:#67e8f9}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:16px 0}.c{background:#101b2d;border:1px solid #26364e;border-radius:10px;padding:12px}.v{font-size:22px;font-weight:800}.mini{font-size:10px;color:#94a3b8}table{width:100%;border-collapse:collapse;background:#101b2d;margin-top:12px}th,td{padding:8px;border-bottom:1px solid #26364e;text-align:left}input,button{padding:7px;border-radius:7px;border:1px solid #334155;background:#0c1727;color:#fff}</style></head><body>
+<p><a href="/">← Dashboard</a></p><h1>Dynamic Daily Operations Report</h1>
+<form><input type="date" name="date" value="{{date}}"><button>Load</button></form>
+<div class="mini">All figures use stored PARKMIND/simulator event timestamps for {{date}}.</div>
+<div class="cards">
+<div class="c"><div class="v">{{summary.arrivals}}</div><div class="mini">Arrivals</div></div>
+<div class="c"><div class="v">{{summary.departures}}</div><div class="mini">Departures</div></div>
+<div class="c"><div class="v">{{'%.2f'|format(summary.revenue)}}</div><div class="mini">Accepted Revenue</div></div>
+<div class="c"><div class="v">{{summary.penalties}}</div><div class="mini">Penalties</div></div>
+<div class="c"><div class="v">{{summary.alerts}}</div><div class="mini">Important Alerts</div></div>
+<div class="c"><div class="v">{{summary.repairs}}</div><div class="mini">Maintenance Jobs</div></div>
+<div class="c"><div class="v">{{summary.failed_logins}}</div><div class="mini">Failed Logins</div></div>
+</div>
+<h2>Important Alerts</h2><table><tr><th>Time</th><th>Type</th><th>Target</th><th>Reason</th></tr>
+{% for a in alerts %}<tr><td>{{a.event_time or a.created_at}}</td><td>{{a.alert_type}}</td><td>{{a.plate or '-'}}</td><td>{{a.reason}}</td></tr>
+{% else %}<tr><td colspan="4">No alerts for this date.</td></tr>{% endfor %}</table>
+<h2>Accepted Payments</h2><table><tr><th>Plate</th><th>Parking</th><th>Charging</th><th>Total</th></tr>
+{% for p in payments %}<tr><td>{{p.plate}}</td><td>{{'%.2f'|format(p.parking_cost or 0)}}</td><td>{{'%.2f'|format(p.charging_cost or 0)}}</td><td>{{'%.2f'|format(p.actual_paid or 0)}}</td></tr>
+{% else %}<tr><td colspan="4">No accepted payments for this date.</td></tr>{% endfor %}</table></body></html>
+"""
+
+AUDIT_HTML = """
+<!doctype html><html><head><title>PARKMIND — Audit</title>
+<style>body{font-family:Segoe UI,Arial;background:#07111f;color:#e5e7eb;margin:0;padding:20px}a{color:#67e8f9}table{width:100%;border-collapse:collapse;background:#101b2d}th,td{padding:8px;border-bottom:1px solid #26364e;text-align:left;font-size:11px}th{color:#94a3b8}.ok{color:#86efac}.bad{color:#f87171}</style></head><body>
+<p><a href="/">← Dashboard</a> · <a href="/search">Search raw events/decisions</a></p><h1>Actor Audit Log</h1>
+<table><tr><th>Time</th><th>Actor</th><th>Role</th><th>Action</th><th>Target</th><th>Detail</th><th>Result</th></tr>
+{% for a in rows %}<tr><td>{{a.created_at}}</td><td>{{a.actor}}</td><td>{{a.role}}</td><td>{{a.action}}</td><td>{{a.target}}</td><td>{{a.detail}}</td><td class="{{'bad' if a.result in ('FAILED','DENIED','REJECTED') else 'ok'}}">{{a.result}}</td></tr>
+{% else %}<tr><td colspan="7">No actor audit entries yet.</td></tr>{% endfor %}</table></body></html>
+"""
+
+@app.route("/audit")
+def audit_page():
+    if not require_admin():
+        return ("Admin only", 403)
+    conn = db()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 500").fetchall()]
+    conn.close()
+    return render_template_string(AUDIT_HTML, rows=rows)
+
+
+@app.route("/penalties")
+def penalties_page():
+    if not require_login():
+        return redirect(url_for("login"))
+    conn = db()
+    rows = []
+    for raw in conn.execute("SELECT * FROM penalties ORDER BY id DESC LIMIT 300").fetchall():
+        item = dict(raw)
+        payload = {}
+        try:
+            payload = json.loads(item.get("payload") or "{}")
+        except Exception:
+            payload = {}
+        item["plate"] = str(item.get("plate") or payload.get("CarPlateNumber") or payload.get("PlateNumber") or "")
+        item["event_time"] = str(item.get("event_time") or payload.get("ServerDateTime") or item.get("detected_at") or "")
+        rows.append(item)
+    conn.close()
+    return render_template_string(PENALTIES_HTML, rows=rows)
+
+
+@app.route("/reports/daily")
+def daily_report_page():
+    if not require_admin():
+        return ("Admin only", 403)
+    selected = (request.args.get("date") or "").strip()
+    if not selected:
+        selected = str(last_simulator_time or "")[:10] or datetime.now().strftime("%Y-%m-%d")
+    conn = db()
+    time_expr = "COALESCE(departure_time, exit_arrival_time, parked_time, entry_time, '')"
+    def one(sql, args=()):
+        try:
+            return conn.execute(sql, args).fetchone()[0] or 0
+        except Exception:
+            return 0
+    summary = {
+        "arrivals": int(one("SELECT COUNT(*) FROM cars WHERE substr(entry_time,1,10)=?", (selected,))),
+        "departures": int(one("SELECT COUNT(*) FROM cars WHERE substr(departure_time,1,10)=?", (selected,))),
+        "revenue": float(one(f"SELECT COALESCE(SUM(actual_paid),0) FROM cars WHERE payment_status='PAID' AND substr({time_expr},1,10)=?", (selected,))),
+        "penalties": int(one("SELECT COUNT(*) FROM penalties WHERE substr(COALESCE(NULLIF(event_time,''),detected_at),1,10)=?", (selected,))),
+        "alerts": int(one("SELECT COUNT(*) FROM alerts WHERE substr(COALESCE(event_time,created_at,''),1,10)=?", (selected,))),
+        "failed_logins": int(one("SELECT COUNT(*) FROM login_attempts WHERE success=0 AND substr(attempted_at,1,10)=?", (selected,))),
+        "repairs": 0,
+    }
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "maintenance_dashboard_jobs" in tables:
+            summary["repairs"] = int(one(
+                "SELECT COUNT(*) FROM maintenance_dashboard_jobs WHERE substr(COALESCE(start_sim_time,started_at,''),1,10)=?",
+                (selected,)
+            ))
+    except Exception:
+        pass
+    alerts = [dict(r) for r in conn.execute(
+        "SELECT * FROM alerts WHERE substr(COALESCE(event_time,created_at,''),1,10)=? ORDER BY id DESC LIMIT 100",
+        (selected,)
+    ).fetchall()]
+    payments = [dict(r) for r in conn.execute(
+        f"SELECT plate,parking_cost,charging_cost,actual_paid FROM cars WHERE payment_status='PAID' AND substr({time_expr},1,10)=? ORDER BY {time_expr} DESC LIMIT 200",
+        (selected,)
+    ).fetchall()]
+    conn.close()
+    log_audit("DAILY_REPORT_VIEW", selected, "Dynamic daily operations/financial report opened", "SUCCESS")
+    return render_template_string(DAILY_REPORT_HTML, date=selected, summary=summary, alerts=alerts, payments=payments)
+
+
+@app.route("/admin/manual-car/recover", methods=["POST"])
+def manual_car_recovery():
+    """Audited exception flow for a real car that bypassed normal entry/spot sensing.
+
+    This does not weaken ghost-payment checks. Instead an Admin must explicitly
+    convert the physical exception into a tracked trip before normal payment/exit
+    rules are allowed to operate.
+    """
+    if not require_admin():
+        return ("Admin only", 403)
+
+    plate = " ".join((request.form.get("plate") or "").upper().split())
+    car_type = (request.form.get("car_type") or "Normal").strip()
+    spot = (request.form.get("spot") or "").strip()
+    start_exit = request.form.get("start_exit") == "1"
+    try:
+        estimated = max(1, min(1440, int(request.form.get("estimated_minutes") or 1)))
+    except Exception:
+        estimated = 1
+
+    if not plate:
+        return ("Plate is required", 400)
+    if car_type not in ("Normal", "Electric", "Accessible"):
+        return ("Unsupported car type", 400)
+
+    existing = get_car(plate) or {}
+    already_at_exit = existing.get("status") in ("AT_EXIT", "PAYMENT_PENDING", "PAYMENT_HOLD") or bool(existing.get("exit_arrival_time"))
+    if not already_at_exit and (not spot or spot not in spots):
+        return ("Select the physical parking bay for a vehicle that is not already at ExitSpot", 400)
+    if spot and (spots.get(spot, {}).get("broken") or spots.get(spot, {}).get("isUnderMaintenance")):
+        return ("Selected parking bay is unavailable/broken", 409)
+    if spot and spots.get(spot, {}).get("occupied"):
+        current = get_car(plate) or {}
+        if current.get("actual_spot") != spot and current.get("assigned_spot") != spot:
+            return ("Selected parking bay is already occupied", 409)
+    if spot and spot in reserved_spots and reserved_spots.get(spot, {}).get("plate") != plate:
+        return ("Selected parking bay is reserved for another vehicle", 409)
+
+    now_dt = simulator_now() or datetime.now()
+    observed_start = now_dt - timedelta(minutes=estimated)
+    observed_text = observed_start.strftime("%Y-%m-%d %H:%M:%S")
+    note = f"[MANUAL RECOVERY] Admin={session.get('user')} estimated={estimated}min spot={spot or 'EXIT'}"
+
+    if already_at_exit:
+        exit_time = existing.get("exit_arrival_time") or now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        upsert_car(
+            plate, car_type=car_type, planned_minutes=estimated,
+            entry_time=existing.get("entry_time") or observed_text,
+            parked_time=existing.get("parked_time") or observed_text,
+            operator_note=note,
+            status="AT_EXIT"
+        )
+        minutes, parking_cost, charging_cost = calculate_charge(plate, exit_time)
+        expected = parking_cost + charging_cost
+        upsert_car(
+            plate, exit_arrival_time=exit_time, billable_minutes=minutes,
+            parking_cost=parking_cost, charging_cost=charging_cost,
+            total_charge=expected, expected_amount=expected,
+            payment_status="WAITING_TO_CHARGE", status="AT_EXIT"
+        )
+        with state_lock:
+            charge_attempt_counts[plate] = 0
+            charge_attempt_scheduled.discard(plate)
+        schedule_charge_attempt(plate, parking_cost, charging_cost, trigger="manual recovery at ExitSpot")
+        detail = f"Recovered existing ExitSpot vehicle; expected={expected:.2f}"
+    else:
+        with state_lock:
+            spots[spot]["occupied"] = True
+        upsert_car(
+            plate, car_type=car_type, planned_minutes=estimated,
+            assigned_spot=spot, actual_spot=spot,
+            entry_time=observed_text, parked_time=observed_text,
+            expected_amount=0, actual_paid=0, billable_minutes=0,
+            parking_cost=0, charging_cost=0, total_charge=0,
+            payment_status="NONE", status="PARKED", operator_note=note
+        )
+        append_journey(plate, f"manual_recovery@{spot}")
+        detail = f"Registered physical exception at {spot}; estimated prior stay={estimated}min"
+        if start_exit:
+            threading.Thread(target=request_exit_lane, args=(plate,), daemon=True).start()
+            detail += "; normal exit workflow started"
+
+    conn = db()
+    conn.execute(
+        """INSERT INTO manual_recoveries(created_at,actor,plate,car_type,spot,estimated_minutes,recovery_state,detail)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), session.get("user"), plate, car_type, spot,
+         estimated, "AT_EXIT" if already_at_exit else "REGISTERED", detail)
+    )
+    conn.commit()
+    conn.close()
+    log_decision(plate, "MANUAL_VEHICLE_RECOVERY", detail,
+                 "Admin-authorized exception converted an untracked physical vehicle into a normal audited trip.")
+    log_audit("MANUAL_VEHICLE_RECOVERY", plate, detail, "SUCCESS")
+    return redirect(url_for("dashboard"))
+
+
 # [INNOVATION #14] — CSV EXPORT
 @app.route("/export/cars")
 def export_cars():
     if not require_admin():
         return ("Admin only", 403)
+    log_audit("FINANCIAL_EXPORT", "cars.csv", "Vehicle/payment CSV export requested", "SUCCESS")
     conn = db()
     rows = conn.execute("SELECT * FROM cars ORDER BY entry_time DESC").fetchall()
     conn.close()
@@ -11057,7 +11551,7 @@ if __name__ == "__main__":
         print("[STARTUP] Start the simulator; PARKMIND will safely sync on the first arrival.")
 
     print("\n============================================")
-    print("  PARKMIND v3.0 — Persistent Manual Gate Override + Race-Safe Exit Edition")
+    print("  PARKMIND v3.1 — Level-2 Compliance + Preserved Parking Workflow")
     print("  Team: Pretty Little Hackers")
     print("  Dashboard: http://127.0.0.1:8000")
     print("  Webhook:   http://127.0.0.1:8000/webhook")
