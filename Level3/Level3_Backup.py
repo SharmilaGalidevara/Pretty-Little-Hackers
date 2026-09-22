@@ -321,7 +321,6 @@ last_processed_sequence = None
 # event worker never compete with each other for the same expensive checkpoint.
 runtime_persist_lock = threading.RLock()
 runtime_persist_meta_lock = threading.Lock()
-db_write_lock = threading.RLock()
 last_runtime_persist_monotonic = 0.0
 events_since_runtime_persist = 0
 
@@ -329,33 +328,6 @@ events_since_runtime_persist = 0
 # =====================================================================
 # DATABASE
 # =====================================================================
-def _run_sqlite_write(sql, params=(), retries=8):
-    """Serialize SQLite writes and retry transient database-locked errors."""
-    last_exc = None
-    for attempt in range(retries):
-        try:
-            with db_write_lock:
-                conn = db()
-                try:
-                    conn.execute(sql, params)
-                    conn.commit()
-                    return True
-                finally:
-                    conn.close()
-        except sqlite3.OperationalError as exc:
-            last_exc = exc
-            msg = str(exc).lower()
-            if "locked" not in msg and "busy" not in msg:
-                raise
-            if attempt < retries - 1:
-                time.sleep(0.2 * (attempt + 1))
-                continue
-            raise
-    if last_exc is not None:
-        raise last_exc
-    return False
-
-
 def db():
     # WAL lets dashboard readers continue while webhook/event workers are writing.
     # busy_timeout absorbs short write bursts instead of surfacing "database locked".
@@ -670,10 +642,13 @@ def format_duration(seconds):
 
 
 def log_decision(plate, action, detail, reasoning=""):
-    _run_sqlite_write(
+    conn = db()
+    conn.execute(
         "INSERT INTO decisions(created_at, plate, action, detail, reasoning) VALUES(?,?,?,?,?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, action, detail, reasoning),
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, action, detail, reasoning)
     )
+    conn.commit()
+    conn.close()
     print(f"[DECISION] {plate or '-'} | {action} | {detail} | {reasoning}")
 
 
@@ -682,18 +657,23 @@ def log_manual_override(component_type, component_name, action, previous_state, 
     username = str(session.get("user") or "system")
     role = str(session.get("role") or "SYSTEM")
     zone_parent = _component_zone(component_name) if component_name else ""
-    _run_sqlite_write(
-        """INSERT INTO manual_override_log(
-               created_at,username,role,component_type,component_name,zone_parent,
-               action,previous_state,result,detail,state_after
-           ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), username, role,
-            str(component_type or ""), str(component_name or ""), zone_parent,
-            str(action or "").upper(), str(previous_state or ""),
-            str(result or ""), str(detail or ""), str(state_after or "")
-        ),
-    )
+    conn = db()
+    try:
+        conn.execute(
+            """INSERT INTO manual_override_log(
+                   created_at,username,role,component_type,component_name,zone_parent,
+                   action,previous_state,result,detail,state_after
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), username, role,
+                str(component_type or ""), str(component_name or ""), zone_parent,
+                str(action or "").upper(), str(previous_state or ""),
+                str(result or ""), str(detail or ""), str(state_after or "")
+            )
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def checkpoint_manual_override(reason):
@@ -710,35 +690,44 @@ def checkpoint_manual_override(reason):
 
 
 def log_anomaly(plate, kind, detail):
-    _run_sqlite_write(
+    conn = db()
+    conn.execute(
         "INSERT INTO anomalies(detected_at, plate, kind, detail) VALUES(?,?,?,?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, kind, detail),
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, kind, detail)
     )
+    conn.commit()
+    conn.close()
     with state_lock:
         stats["anomalies_flagged"] += 1
     print(f"[ANOMALY] {plate or '-'} | {kind} | {detail}")
 
 
 def log_fraud(plate, reason, attempted_amount):
-    _run_sqlite_write(
+    conn = db()
+    conn.execute(
         "INSERT INTO fraud_log(detected_at, plate, reason, attempted_amount) VALUES(?,?,?,?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, reason, attempted_amount),
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plate, reason, attempted_amount)
     )
+    conn.commit()
+    conn.close()
     with state_lock:
         stats["fraud_attempts_blocked"] += 1
     print(f"[FRAUD BLOCKED] {plate or '-'} | {reason} | amount={attempted_amount}")
 
 
 def log_penalty(reason, fine_amount, payload=None):
-    _run_sqlite_write(
+    conn = db()
+    conn.execute(
         "INSERT INTO penalties(detected_at, reason, fine_amount, payload) VALUES(?,?,?,?)",
         (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             str(reason or ""),
             float(fine_amount or 0),
             json.dumps(payload or {})
-        ),
+        )
     )
+    conn.commit()
+    conn.close()
     with state_lock:
         stats["total_penalties"] += 1
     print(f"[PENALTY] {reason} | fine={fine_amount}")
@@ -763,7 +752,8 @@ def log_network_security(category, data=None, detail="", fingerprint="", remote_
     except Exception:
         full_payload = str(data or raw_preview or "")
     preview = str(preview)[:SECURITY_PAYLOAD_PREVIEW]
-    _run_sqlite_write(
+    conn = db()
+    cur = conn.execute(
         """INSERT INTO network_security_log(
                received_at, category, event_id, sequence_id, event_class,
                remote_addr, request_fingerprint, detail, payload_preview, payload_full
@@ -777,18 +767,20 @@ def log_network_security(category, data=None, detail="", fingerprint="", remote_
             str(remote_addr or ""),
             str(fingerprint or ""),
             str(detail or ""),
-            str(preview or ""),
-            str(full_payload or "")
-        ),
+            preview,
+            full_payload,
+        )
     )
     # Bound hostile/duplicate log growth without depending on AUTOINCREMENT ids.
     # A cheap 1% sampling keeps cleanup amortised and still caps long-running logs.
     if SECURITY_LOG_MAX_ROWS > 0 and random.random() < 0.01:
-        _run_sqlite_write(
+        conn.execute(
             "DELETE FROM network_security_log WHERE id NOT IN "
             "(SELECT id FROM network_security_log ORDER BY id DESC LIMIT ?)",
-            (SECURITY_LOG_MAX_ROWS,),
+            (SECURITY_LOG_MAX_ROWS,)
         )
+    conn.commit()
+    conn.close()
 
 
 def canonical_event_key(data, fingerprint=""):
@@ -975,8 +967,7 @@ def _persist_runtime_state_impl(reason="checkpoint", write_history=False):
         "physical_exit_queue": queues.get("physical_exit_queue", []),
     }
 
-    with db_write_lock:
-        conn = db()
+    conn = db()
     try:
         conn.execute("BEGIN IMMEDIATE")
         old = conn.execute(
@@ -2409,12 +2400,19 @@ def route_path_viable(zone_name, perimeter_role=None):
 
 
 def _route_gate_names_for_zone(zone_name, perimeter_role=None):
-    """Return one healthy alternative from each API-discovered gate group.
+    """Build the movement path using the proven Level-2 parking semantics.
 
-    Level 2 required every barrier in a group to become Open.  At airport scale
-    that turns one broken gate into a total route deadlock.  Level 3 treats gates
-    sharing the same topology role as alternatives and requires one healthy gate
-    from the target/source zone plus one healthy perimeter gate when needed.
+    Level 2 works because a car is released only after the complete discovered
+    zone barrier path is open.  Level 3 keeps that behaviour, but filters out
+    gates that are genuinely unavailable (broken / maintenance / manual CLOSED)
+    so one failed sibling does not kill the whole airport.
+
+    perimeter_role:
+      - "entry": one healthy API-derived perimeter entry gate + ALL healthy
+                 barriers belonging to the target zone
+      - "exit":  ALL healthy source-zone barriers + one healthy API-derived
+                 perimeter exit gate
+      - None:    ALL healthy barriers belonging to the zone
     """
     names = []
     zone_name = str(zone_name or "")
@@ -2424,9 +2422,12 @@ def _route_gate_names_for_zone(zone_name, perimeter_role=None):
         if selected:
             names.append(selected)
 
-    zone_selected = select_route_gate(zone_gates.get(zone_name or "", []))
-    if zone_selected and zone_selected not in names:
-        names.append(zone_selected)
+    # IMPORTANT: Level-2 behaviour. Do not collapse a zone barrier group to one
+    # arbitrary gate. Open every healthy barrier associated with that zone so the
+    # simulator always has a complete path to the selected parking bay.
+    for name in list(zone_gates.get(zone_name, [])):
+        if name and name not in names and gate_route_available(name):
+            names.append(name)
 
     if perimeter_role == "exit":
         selected = select_route_gate(perimeter_gates, preferred=EXIT_GATE)
@@ -2434,7 +2435,6 @@ def _route_gate_names_for_zone(zone_name, perimeter_role=None):
             names.append(selected)
 
     return names
-
 
 
 def open_route_gates(zone_name, reason="route", perimeter_role=None, gate_names=None):
@@ -3488,28 +3488,33 @@ def _natural_zone_key(name):
 
 
 def choose_spot(car_type, planned_minutes, avoid_busy_zone_gates=False, preferred_zone=None):
-    """Choose a safe compatible bay across every API-discovered airport zone.
+    """Choose a safe compatible bay using the proven Level-2 zone policy.
 
-    Level-3 additions:
-      * zones whose complete gate group is unavailable are skipped;
-      * sensor-quarantined/maintenance bays are never allocated;
-      * existing Zone1 -> Zone2 -> ... spillover behavior is preserved.
+    Parking order is ALWAYS the natural API-discovered zone order:
+        Zone 1 -> Zone 2 -> Zone 3 -> ... -> Zone N
+
+    If a lower-numbered zone currently has a car using its gate crossing, the
+    next arrival immediately spills to the next free zone.  The EntrySpot that
+    happened to detect the car does NOT pin or prioritise a parking zone.
+
+    Level-3 protections are retained:
+      * broken / maintenance / sensor-quarantined bays are excluded;
+      * zones with no healthy route gate are skipped;
+      * reservations and compatibility rules are respected.
     """
     zone_names = sorted(
         {str(s.get("zoneParent") or "") for s in spots.values() if str(s.get("zoneParent") or "")},
         key=_natural_zone_key,
     )
-    preferred_zone = str(preferred_zone or "")
-    if preferred_zone in zone_names:
-        zone_names = [preferred_zone] + [z for z in zone_names if z != preferred_zone]
+    # Keep unzoned bays as a final fallback for future simulator layouts.
     zone_names.append("")
 
     busy_zones_with_capacity = []
     blocked_gate_zones = []
 
     for zone_name in zone_names:
-        # If this zone exposes barriers, at least one must be healthy. This turns
-        # a broken gate into zone spillover instead of a permanent JIT wait.
+        # Level-3 resilience layered on top of Level-2 ordering: if a zone has
+        # barriers but none are usable, skip it and continue to the next zone.
         if zone_name and zone_gates.get(zone_name) and not available_route_gates(zone_gates.get(zone_name)):
             blocked_gate_zones.append(zone_name)
             continue
@@ -3523,6 +3528,7 @@ def choose_spot(car_type, planned_minutes, avoid_busy_zone_gates=False, preferre
                 continue
             if name in reserved_spots:
                 continue
+
             score, reason = smart_spot_score(name, spot, car_type, planned_minutes)
             if score < 0:
                 continue
@@ -3531,6 +3537,8 @@ def choose_spot(car_type, planned_minutes, avoid_busy_zone_gates=False, preferre
         if not candidates:
             continue
 
+        # Proven Level-2 spillover: never stack a second inbound vehicle behind
+        # a zone crossing already owned by another car. Try the next zone now.
         if avoid_busy_zone_gates and zone_name and zone_crossing_busy(zone_name):
             busy_zones_with_capacity.append(zone_name)
             continue
@@ -3538,14 +3546,15 @@ def choose_spot(car_type, planned_minutes, avoid_busy_zone_gates=False, preferre
         candidates.sort(key=lambda x: (-x[0], natural_spot_key(x[1]), x[1]))
         best = candidates[0]
         priority = zone_name or "UNZONED"
+
         annotations = []
         if busy_zones_with_capacity:
             annotations.append(f"SPILLED_PAST_BUSY={','.join(busy_zones_with_capacity)}")
         if blocked_gate_zones:
             annotations.append(f"SPILLED_PAST_FAILED_GATES={','.join(blocked_gate_zones)}")
         prefix = (" | ".join(annotations) + " | ") if annotations else ""
-        entry_pref = f"ENTRY_ZONE_PREFERENCE={preferred_zone} | " if preferred_zone else ""
-        return best[1], f"{entry_pref}{prefix}ZONE_PRIORITY={priority} | {best[2]}"
+
+        return best[1], f"{prefix}ZONE_PRIORITY={priority} | {best[2]}"
 
     if avoid_busy_zone_gates and busy_zones_with_capacity:
         return None, f"WAIT_ALL_ZONE_GATES_BUSY={','.join(busy_zones_with_capacity)}"
@@ -3863,9 +3872,10 @@ def process_entry_queue():
         else:
             # Admission-aware selection: if one car already occupies Zone 1's
             # gate path, immediately try Zone 2; then Zone 3; etc.
+            # LEVEL-2 PARKING POLICY: always evaluate Zone 1 -> Zone 2 -> ...
+            # The physical EntrySpot does not pin the car to one parking zone.
             spot, reason = choose_spot(
-                car_type, planned, avoid_busy_zone_gates=True,
-                preferred_zone=item.get("entry_zone"),
+                car_type, planned, avoid_busy_zone_gates=True
             )
 
         if not spot:
@@ -5760,73 +5770,96 @@ def webhook():
 # =====================================================================
 # WEB DASHBOARD + ROLES
 # =====================================================================
+ADMIN_USER = os.getenv("PARKMIND_ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.getenv("PARKMIND_ADMIN_PASSWORD", "admin")
+OPERATOR_USER = os.getenv("PARKMIND_OPERATOR_USER", "operator")
+OPERATOR_PASSWORD = os.getenv("PARKMIND_OPERATOR_PASSWORD", "operator")
 MAINTENANCE_USER = os.getenv("PARKMIND_MAINT_USER", "maintenance")
 MAINTENANCE_PASSWORD = os.getenv("PARKMIND_MAINT_PASSWORD", "maintenance")
 
 USERS = {
-    "admin": {"password": "admin", "role": "Admin"},
-    "operator": {"password": "operator", "role": "Operator"},
+    ADMIN_USER: {"password": ADMIN_PASSWORD, "role": "Admin"},
+    OPERATOR_USER: {"password": OPERATOR_PASSWORD, "role": "Operator"},
     MAINTENANCE_USER: {"password": MAINTENANCE_PASSWORD, "role": "Maintenance"},
 }
 
+# Level-2-style login GUI, with explicit role entry points so every account has
+# one obvious login screen and one deterministic destination dashboard.
 LOGIN_HTML = """
 <!doctype html>
-<title>PARKMIND v3 — Login</title>
+<html>
+<head>
+<title>PARKMIND v3.7 — Login</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{font-family:'Segoe UI',Arial;background:#0f172a;color:#e5e7eb;display:grid;place-items:center;height:100vh;margin:0}
-.card{background:#1e293b;padding:36px;border-radius:18px;width:340px;box-shadow:0 20px 60px rgba(0,0,0,0.4)}
+*{box-sizing:border-box}
+body{font-family:'Segoe UI',Arial;background:#0f172a;color:#e5e7eb;display:grid;place-items:center;min-height:100vh;margin:0;padding:20px}
+.card{background:#1e293b;padding:34px;border-radius:18px;width:min(390px,100%);box-shadow:0 20px 60px rgba(0,0,0,.4);border:1px solid #334155}
 h1{margin:0 0 4px;font-size:28px;background:linear-gradient(90deg,#22d3ee,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-input,button{width:100%;box-sizing:border-box;padding:12px;margin:8px 0;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#fff}
-button{font-weight:bold;cursor:pointer;background:linear-gradient(90deg,#0ea5e9,#7c3aed);border:0}
-button:hover{filter:brightness(1.15)}
-.err{color:#fca5a5;font-size:14px}
-.sub{opacity:.6;font-size:13px;margin-top:8px}
-.badge{display:inline-block;background:#0f172a;color:#22d3ee;padding:4px 10px;border-radius:8px;font-size:11px;margin:2px}
+input,button{width:100%;padding:12px;margin:7px 0;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#fff}
+button{font-weight:800;cursor:pointer;background:linear-gradient(90deg,#0ea5e9,#7c3aed);border:0}
+button:hover,.rolebtn:hover{filter:brightness(1.12)}
+.err{color:#fca5a5;font-size:13px;background:#3b1118;border:1px solid #7f1d1d;padding:9px;border-radius:9px}
+.sub{color:#94a3b8;font-size:12px;margin-top:8px}
+.badges{margin:11px 0}.badge{display:inline-block;background:#0f172a;color:#22d3ee;padding:4px 8px;border-radius:8px;font-size:10px;margin:2px}
+.roles{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin:14px 0 10px}
+.rolebtn{display:block;text-align:center;text-decoration:none;color:#e5e7eb;background:#111827;border:1px solid #334155;border-radius:10px;padding:10px 5px;font-size:11px;font-weight:800}
+.rolebtn span{display:block;font-size:18px;margin-bottom:4px}.hint{text-align:center;color:#64748b;font-size:10px;margin:8px 0 0}
 </style>
+</head>
+<body>
 <div class="card">
 <h1>PARKMIND v3.7</h1>
 <p class="sub">Pretty Little Hackers — Level 3 Airport Control Center</p>
-<div style="margin:10px 0">
-<span class="badge">Signature Verified</span>
-<span class="badge">Sequence Gap Detection</span>
-<span class="badge">Multi-Factor Payment</span>
-<span class="badge">Smart Spot AI</span>
-<span class="badge">Maintenance Control</span>
+<div class="badges">
+<span class="badge">Signature Verified</span><span class="badge">Sequence Gap Detection</span>
+<span class="badge">Multi-Factor Payment</span><span class="badge">Maintenance Control</span>
 </div>
-{% if error %}<p class="err">{{error}}</p>{% endif %}
-<form method="post">
-<input name="username" placeholder="Username" required>
-<input name="password" type="password" placeholder="Password" required>
-<button>Login</button>
+<div class="roles">
+<a class="rolebtn" href="/admin/login"><span>🛡️</span>ADMIN</a>
+<a class="rolebtn" href="/operator/login"><span>🎛️</span>OPERATOR</a>
+<a class="rolebtn" href="/maintenance/login"><span>🛠️</span>MAINTENANCE</a>
+</div>
+{% if error %}<div class="err">{{error}}</div>{% endif %}
+<form method="post" action="/login">
+<input name="username" placeholder="Username" autocomplete="username" required autofocus>
+<input name="password" type="password" placeholder="Password" autocomplete="current-password" required>
+<button type="submit">Login</button>
 </form>
-<p class="sub">admin/admin · operator/operator · maintenance/maintenance</p>
+<p class="hint">Default: admin/admin · operator/operator · maintenance/maintenance</p>
 </div>
+</body></html>
 """
 
-OPERATOR_LOGIN_HTML = """
+ROLE_LOGIN_HTML = """
 <!doctype html>
-<title>PARKMIND — Operator Login</title>
+<html><head>
+<title>PARKMIND — {{role_name}} Login</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{font-family:'Segoe UI',Arial;background:#0b1120;color:#e5e7eb;display:grid;place-items:center;min-height:100vh;margin:0}
-.card{width:340px;background:#111827;border:1px solid #263244;border-radius:16px;padding:28px}
+*{box-sizing:border-box}body{font-family:'Segoe UI',Arial;background:#0b1120;color:#e5e7eb;display:grid;place-items:center;min-height:100vh;margin:0;padding:20px}
+.card{width:min(360px,100%);background:#111827;border:1px solid #263244;border-radius:16px;padding:28px;box-shadow:0 18px 55px rgba(0,0,0,.4)}
 h1{margin:0 0 4px;color:#67e8f9}.sub{font-size:12px;color:#94a3b8;margin-bottom:16px}
 input,button{width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:8px}
-input{background:#0b1120;color:#fff;border:1px solid #334155}
-button{border:0;background:#0284c7;color:#fff;font-weight:700;cursor:pointer}
-.err{color:#fca5a5;font-size:12px}a{color:#67e8f9;font-size:12px}
-</style>
+input{background:#0b1120;color:#fff;border:1px solid #334155}button{border:0;background:#0284c7;color:#fff;font-weight:800;cursor:pointer}
+.err{color:#fca5a5;font-size:12px;background:#32141b;border:1px solid #7f1d1d;padding:8px;border-radius:8px;margin-bottom:8px}
+a{color:#67e8f9;font-size:12px;text-decoration:none}.icon{font-size:30px;margin-bottom:7px}.foot{margin-top:12px;display:flex;justify-content:space-between;gap:8px}
+</style></head><body>
 <div class="card">
-<h1>Operator Login</h1>
-<div class="sub">Live parking operations and incident response</div>
+<div class="icon">{{icon}}</div><h1>{{role_name}} Login</h1>
+<div class="sub">{{description}}</div>
 {% if error %}<div class="err">{{error}}</div>{% endif %}
-<form method="post">
-<input name="username" value="operator" readonly>
-<input name="password" type="password" placeholder="Operator password" required autofocus>
-<button>Enter Operator Dashboard</button>
+<form method="post" action="{{action}}">
+<input name="username" value="{{username}}" readonly autocomplete="username">
+<input name="password" type="password" placeholder="{{role_name}} password" autocomplete="current-password" required autofocus>
+<button type="submit">Enter {{button_label}}</button>
 </form>
-<p><a href="/login">Admin / standard login</a></p>
-</div>
+<div class="foot"><a href="/login">← All logins</a><a href="/logout">Clear session</a></div>
+</div></body></html>
 """
+
+# Kept for compatibility with any older code/tests that reference this name.
+OPERATOR_LOGIN_HTML = ROLE_LOGIN_HTML
 
 
 DASH_HTML = """
@@ -5897,6 +5930,12 @@ summary{cursor:pointer;color:#cbd5e1;font-size:11px;font-weight:700}
 {% if role == "Operator" %}
 <div class="operator-note">
 OPERATOR VIEW — live vehicle status, alerts, gate control and recovery actions. Administrative exports, sync and judge tools are hidden.
+</div>
+{% endif %}
+
+{% if role == "Admin" %}
+<div class="operator-note" style="background:#2e1065;border-color:#7c3aed;color:#e9d5ff">
+ADMIN VIEW — full Level 3 control, network security, database persistence, maintenance access, exports and judge tools are available.
 </div>
 {% endif %}
 
@@ -6319,41 +6358,136 @@ def require_admin():
     return require_login() and session.get("role") == "Admin"
 
 
+def _role_home(role):
+    """Return the one correct GUI destination for a successfully authenticated role."""
+    if role == "Maintenance":
+        return url_for("maintenance.dashboard")
+    return url_for("dashboard")
+
+
+def _authenticate_user(username, password, expected_role=None):
+    """Small, deterministic authentication helper used by all three login GUIs."""
+    username = str(username or "").strip()
+    password = str(password or "")
+    user = USERS.get(username)
+    if not user:
+        return None
+    if expected_role and user.get("role") != expected_role:
+        return None
+    stored = str(user.get("password") or "")
+    if not hmac.compare_digest(stored, password):
+        return None
+    return user
+
+
+def _finish_login(username, user):
+    # The old Level-2 flow assumes the SQLite schema already exists because the
+    # script is normally launched directly. Calling init_db here also makes login
+    # reliable under Flask/WSGI/IDE launchers where __main__ startup may not run.
+    init_db()
+    session.clear()
+    session["user"] = username
+    session["role"] = user["role"]
+    return redirect(_role_home(user["role"]))
+
+
+def _render_role_login(role_name, username, action, description, icon, button_label, error=None):
+    return render_template_string(
+        ROLE_LOGIN_HTML,
+        role_name=role_name,
+        username=username,
+        action=action,
+        description=description,
+        icon=icon,
+        button_label=button_label,
+        error=error,
+    )
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    # If an already-authenticated user revisits /login, take them directly to
+    # their own GUI instead of making them sign in again.
+    if request.method == "GET" and require_login():
+        return redirect(_role_home(session.get("role")))
+
     error = None
     if request.method == "POST":
         username = request.form.get("username", "")
         password = request.form.get("password", "")
-        u = USERS.get(username)
-        if u and u["password"] == password:
-            session.clear()
-            session["user"] = username
-            session["role"] = u["role"]
-
-            # Maintenance credentials go straight to the maintenance console.
-            if u["role"] == "Maintenance":
-                return redirect(url_for("maintenance.dashboard"))
-
-            return redirect(url_for("dashboard"))
-        error = "Invalid login"
+        user = _authenticate_user(username, password)
+        if user:
+            return _finish_login(str(username).strip(), user)
+        error = "Invalid username or password"
     return render_template_string(LOGIN_HTML, error=error)
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    if request.method == "GET" and require_login() and session.get("role") == "Admin":
+        return redirect(url_for("dashboard"))
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", ADMIN_USER)
+        user = _authenticate_user(username, request.form.get("password", ""), "Admin")
+        if user:
+            return _finish_login(ADMIN_USER, user)
+        error = "Invalid admin password"
+    return _render_role_login(
+        "Admin", ADMIN_USER, url_for("admin_login"),
+        "System supervision, security, database, exports and full control.",
+        "🛡️", "Admin Dashboard", error
+    )
 
 
 @app.route("/operator/login", methods=["GET", "POST"])
 def operator_login():
+    if request.method == "GET" and require_login() and session.get("role") == "Operator":
+        return redirect(url_for("dashboard"))
     error = None
     if request.method == "POST":
-        username = request.form.get("username", "operator")
-        password = request.form.get("password", "")
-        u = USERS.get("operator")
-        if username == "operator" and u and u["password"] == password:
-            session.clear()
-            session["user"] = "operator"
-            session["role"] = "Operator"
-            return redirect(url_for("dashboard"))
+        username = request.form.get("username", OPERATOR_USER)
+        user = _authenticate_user(username, request.form.get("password", ""), "Operator")
+        if user:
+            return _finish_login(OPERATOR_USER, user)
         error = "Invalid operator password"
-    return render_template_string(OPERATOR_LOGIN_HTML, error=error)
+    return _render_role_login(
+        "Operator", OPERATOR_USER, url_for("operator_login"),
+        "Live parking operations, incident response and safe manual controls.",
+        "🎛️", "Operator Dashboard", error
+    )
+
+
+@app.route("/maintenance/login", methods=["GET", "POST"])
+def maintenance_login():
+    if request.method == "GET" and require_login() and session.get("role") == "Maintenance":
+        return redirect(url_for("maintenance.dashboard"))
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", MAINTENANCE_USER)
+        user = _authenticate_user(username, request.form.get("password", ""), "Maintenance")
+        if user:
+            return _finish_login(MAINTENANCE_USER, user)
+        error = "Invalid maintenance password"
+    return _render_role_login(
+        "Maintenance", MAINTENANCE_USER, url_for("maintenance_login"),
+        "Component health, repairs, maintenance jobs and safety interlocks.",
+        "🛠️", "Maintenance Console", error
+    )
+
+
+@app.route("/admin")
+def admin_home():
+    if not require_login() or session.get("role") != "Admin":
+        return redirect(url_for("admin_login"))
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/operator")
+def operator_home():
+    if not require_login() or session.get("role") != "Operator":
+        return redirect(url_for("operator_login"))
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/logout")
@@ -11774,7 +11908,10 @@ if __name__ == "__main__":
     print("  Team: Pretty Little Hackers")
     print("  Dashboard: http://127.0.0.1:8000")
     print("  Webhook:   http://127.0.0.1:8000/webhook")
-    print("  Login:     admin/admin · operator/operator · maintenance/maintenance")
+    print("  Login:       http://127.0.0.1:8000/login")
+    print("  Admin GUI:   http://127.0.0.1:8000/admin/login   (admin/admin)")
+    print("  Operator GUI:http://127.0.0.1:8000/operator/login (operator/operator)")
+    print("  Maint. GUI:  http://127.0.0.1:8000/maintenance/login (maintenance/maintenance)")
     print("  Maintenance: http://127.0.0.1:8000/maintenance/")
     print("  Control:     http://127.0.0.1:8000/control")
     print("  API-derived entry alias:", ENTRY_GATE, "(derived from /list-barriers)")

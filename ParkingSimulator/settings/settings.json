@@ -1,0 +1,13 @@
+{
+  "TeamName": "Pretty Little Hackers",
+  "ListenAddress": "http://0.0.0.0:9898",
+  "WebhookUrl": "http://127.0.0.1:8000/webhook",
+  "ParkingSpeedMuliplier": 2,
+  "MinParkingTime": 1,
+  "MaxParkingTime": 3,
+  "Name": "admin",
+  "Password": "admin",
+  "GameSpeedMultiplier": 1.0,
+  "lvl2Password": "",
+  "lvl3Password": ""
+}
